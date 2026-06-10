@@ -2,7 +2,8 @@ import os
 import logging
 import calendar
 import threading
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, request, jsonify
@@ -34,6 +35,10 @@ if not SUPABASE_ANON_KEY:
     raise RuntimeError("SUPABASE_ANON_KEY is missing")
 
 
+# Business timezone. TimeMoto sends local wall-clock time without an offset,
+# and "today"/day boundaries for /report and /history are computed here.
+APP_TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Monaco"))
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shift_bot")
 
@@ -48,11 +53,10 @@ def is_allowed(update: Update) -> bool:
 def fmt_time(value):
     if not value:
         return "—"
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return dt.strftime("%H:%M")
-    except Exception:
+    dt = parse_timestamp(value)
+    if dt is None:
         return str(value)
+    return dt.astimezone(APP_TZ).strftime("%H:%M")
 
 
 def fmt_duration(minutes):
@@ -83,9 +87,24 @@ def parse_timestamp(value):
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
+    # TimeMoto sends naive local wall-clock time -> interpret it in APP_TZ.
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=APP_TZ)
     return dt
+
+
+def today_local():
+    return datetime.now(APP_TZ).date()
+
+
+def day_bounds_utc(selected_date):
+    """Return [start, end) of a local calendar day as UTC ISO strings."""
+    local_start = datetime.fromisoformat(selected_date).replace(tzinfo=APP_TZ)
+    local_end = local_start + timedelta(days=1)
+    return (
+        local_start.astimezone(timezone.utc).isoformat(),
+        local_end.astimezone(timezone.utc).isoformat(),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -315,9 +334,9 @@ def timemoto_webhook():
     clock_type = data.get("clockingType", "")
     time_logged = data.get("timeLogged", "")
 
-    clock_dt = parse_timestamp(time_logged) or datetime.now(timezone.utc)
-    clock_iso = clock_dt.isoformat()
-    time_display = clock_dt.strftime("%H:%M")
+    clock_dt = parse_timestamp(time_logged) or datetime.now(APP_TZ)
+    clock_iso = clock_dt.astimezone(timezone.utc).isoformat()
+    time_display = clock_dt.astimezone(APP_TZ).strftime("%H:%M")
 
     # Persist to Supabase, but never let a DB error block the notification.
     duration_minutes = None
@@ -399,7 +418,7 @@ def build_calendar(year: int, month: int):
     keyboard.append(
         [
             InlineKeyboardButton("◀️", callback_data=f"cal:{prev_year}:{prev_month}"),
-            InlineKeyboardButton("Today", callback_data=f"history:{date.today().isoformat()}"),
+            InlineKeyboardButton("Today", callback_data=f"history:{today_local().isoformat()}"),
             InlineKeyboardButton("▶️", callback_data=f"cal:{next_year}:{next_month}"),
         ]
     )
@@ -460,7 +479,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_history_for_date(
         update=update,
         context=context,
-        selected_date=date.today().isoformat(),
+        selected_date=today_local().isoformat(),
         title="📋 Отчёт за сегодня",
     )
 
@@ -470,7 +489,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Нет доступа.")
         return
 
-    today = date.today()
+    today = today_local()
 
     await update.message.reply_text(
         "📅 Выберите дату:",
@@ -484,9 +503,7 @@ async def send_history_for_date(
     selected_date: str,
     title: str = "📅 История",
 ):
-    start_dt = f"{selected_date}T00:00:00+00:00"
-    end_date = (datetime.fromisoformat(selected_date) + timedelta(days=1)).date()
-    end_dt = f"{end_date.isoformat()}T00:00:00+00:00"
+    start_dt, end_dt = day_bounds_utc(selected_date)
 
     result = (
         supabase.table("attendance_sessions")
