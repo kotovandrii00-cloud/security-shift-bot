@@ -1,4 +1,5 @@
 import os
+import logging
 import calendar
 import threading
 from datetime import datetime, date, timedelta, timezone
@@ -32,6 +33,9 @@ if not SUPABASE_URL:
 if not SUPABASE_ANON_KEY:
     raise RuntimeError("SUPABASE_ANON_KEY is missing")
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("shift_bot")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 flask_app = Flask(__name__)
@@ -219,6 +223,76 @@ def home():
     return jsonify({"ok": True, "service": "staff-control-bot"})
 
 
+def persist_attendance(
+    user_id, full_name, employee_number, department, location,
+    clock_type, clock_iso, clock_dt,
+):
+    """Write the TimeMoto event to Supabase.
+
+    Returns duration_minutes for an Out event (or None). Raises on DB errors so
+    the caller can still send the Telegram notification.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    employee = upsert_employee(
+        user_id=user_id,
+        full_name=full_name,
+        employee_number=employee_number,
+        department=department,
+        location=location,
+    )
+    if not employee:
+        raise RuntimeError("employee upsert returned no row")
+
+    employee_id = employee["id"]
+    duration_minutes = None
+
+    if clock_type == "In":
+        # Close any stale open session before opening a new one.
+        close_open_sessions(employee_id, clock_iso)
+
+        supabase.table("attendance_sessions").insert(
+            {
+                "employee_id": employee_id,
+                "clock_in_time": clock_iso,
+                "source": "timemoto",
+            }
+        ).execute()
+
+        set_attendance_status(
+            employee_id=employee_id,
+            on_shift=True,
+            clock_in_iso=clock_iso,
+            clock_out_iso=None,
+            now_iso=now_iso,
+        )
+
+    elif clock_type == "Out":
+        session = get_open_session(employee_id)
+
+        set_attendance_status(
+            employee_id=employee_id,
+            on_shift=False,
+            clock_in_iso=(session or {}).get("clock_in_time"),
+            clock_out_iso=clock_iso,
+            now_iso=now_iso,
+        )
+
+        if session:
+            clock_in_dt = parse_timestamp(session.get("clock_in_time"))
+            if clock_in_dt:
+                duration_minutes = int((clock_dt - clock_in_dt).total_seconds() // 60)
+
+            supabase.table("attendance_sessions").update(
+                {
+                    "clock_out_time": clock_iso,
+                    "duration_minutes": duration_minutes,
+                }
+            ).eq("id", session["id"]).execute()
+
+    return duration_minutes
+
+
 @flask_app.route("/timemoto", methods=["GET", "POST"])
 def timemoto_webhook():
 
@@ -244,82 +318,26 @@ def timemoto_webhook():
     clock_dt = parse_timestamp(time_logged) or datetime.now(timezone.utc)
     clock_iso = clock_dt.isoformat()
     time_display = clock_dt.strftime("%H:%M")
-    now_iso = datetime.now(timezone.utc).isoformat()
 
-    employee = upsert_employee(
-        user_id=user_id,
-        full_name=full_name,
-        employee_number=employee_number,
-        department=department,
-        location=location,
-    )
-    if not employee:
-        send_telegram_message(
-            f"⚠️ TimeMoto: не удалось сохранить сотрудника «{full_name}»."
+    # Persist to Supabase, but never let a DB error block the notification.
+    duration_minutes = None
+    try:
+        duration_minutes = persist_attendance(
+            user_id, full_name, employee_number, department, location,
+            clock_type, clock_iso, clock_dt,
         )
-        return jsonify({"ok": False, "error": "employee_upsert_failed"})
+    except Exception:
+        logger.exception("Supabase write failed for TimeMoto webhook")
 
-    employee_id = employee["id"]
-
+    # Telegram notification is always sent.
     if clock_type == "In":
-
-        # Close any stale open session before opening a new one.
-        close_open_sessions(employee_id, clock_iso)
-
-        supabase.table("attendance_sessions").insert(
-            {
-                "employee_id": employee_id,
-                "clock_in_time": clock_iso,
-                "source": "timemoto",
-            }
-        ).execute()
-
-        set_attendance_status(
-            employee_id=employee_id,
-            on_shift=True,
-            clock_in_iso=clock_iso,
-            clock_out_iso=None,
-            now_iso=now_iso,
-        )
-
         send_telegram_message(
             f"🟢 Приход\n\n"
             f"👤 {full_name}\n"
             f"🏢 {department}\n"
             f"🕒 {time_display}"
         )
-
     elif clock_type == "Out":
-
-        session = get_open_session(employee_id)
-
-        set_attendance_status(
-            employee_id=employee_id,
-            on_shift=False,
-            clock_in_iso=(session or {}).get("clock_in_time"),
-            clock_out_iso=clock_iso,
-            now_iso=now_iso,
-        )
-
-        if not session:
-            send_telegram_message(
-                f"⚠️ TimeMoto: для «{full_name}» не найдена открытая смена, "
-                f"уход зафиксирован без длительности."
-            )
-            return jsonify({"ok": True, "warning": "no_open_session"})
-
-        clock_in_dt = parse_timestamp(session.get("clock_in_time"))
-        duration_minutes = None
-        if clock_in_dt:
-            duration_minutes = int((clock_dt - clock_in_dt).total_seconds() // 60)
-
-        supabase.table("attendance_sessions").update(
-            {
-                "clock_out_time": clock_iso,
-                "duration_minutes": duration_minutes,
-            }
-        ).eq("id", session["id"]).execute()
-
         send_telegram_message(
             f"🔴 Уход\n\n"
             f"👤 {full_name}\n"
@@ -328,6 +346,7 @@ def timemoto_webhook():
             f"⏱ {fmt_duration(duration_minutes)}"
         )
 
+    # Always 200 so TimeMoto does not retry-storm on transient DB issues.
     return jsonify({"ok": True})
 
 
