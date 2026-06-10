@@ -20,7 +20,8 @@ from supabase import create_client
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+# Prefer the service_role key (bypasses RLS); fall back to anon for local/dev.
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -31,8 +32,8 @@ if not GROUP_ID:
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL is missing")
 
-if not SUPABASE_ANON_KEY:
-    raise RuntimeError("SUPABASE_ANON_KEY is missing")
+if not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY is missing")
 
 
 # Business timezone. TimeMoto sends local wall-clock time without an offset,
@@ -42,7 +43,7 @@ APP_TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Monaco"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shift_bot")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 flask_app = Flask(__name__)
 
 
@@ -60,10 +61,13 @@ def fmt_time(value):
 
 
 def fmt_duration(minutes):
-    if not minutes:
+    if minutes is None:
         return "смена открыта"
-    hours = int(minutes) // 60
-    mins = int(minutes) % 60
+    minutes = int(minutes)
+    if minutes < 1:
+        return "меньше минуты"
+    hours = minutes // 60
+    mins = minutes % 60
     return f"{hours}ч {mins:02d}м"
 
 
