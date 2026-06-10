@@ -1,8 +1,7 @@
 import os
-import json
 import calendar
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 import requests
 from flask import Flask, request, jsonify
@@ -73,6 +72,148 @@ def send_telegram_message(text: str):
     response.raise_for_status()
 
 
+def parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# --------------------------------------------------------------------------- #
+# Supabase helpers
+# --------------------------------------------------------------------------- #
+
+def find_employee_by_timemoto_id(timemoto_user_id):
+    if not timemoto_user_id:
+        return None
+    result = (
+        supabase.table("employees")
+        .select("id, full_name, timemoto_user_id")
+        .eq("timemoto_user_id", timemoto_user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def find_employee_by_name(full_name):
+    if not full_name:
+        return None
+    result = (
+        supabase.table("employees")
+        .select("id, full_name, timemoto_user_id")
+        .eq("full_name", full_name)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def upsert_employee(user_id, full_name, employee_number, department, location):
+    """Find an employee by TimeMoto user id (fallback: full_name).
+    Update their data if found, otherwise create a new record.
+    Returns the employee row or None.
+    """
+    fields = {
+        "full_name": full_name,
+        "employee_number": employee_number,
+        "position": department,
+        "department": department,
+        "location": location or "",
+    }
+
+    existing = find_employee_by_timemoto_id(user_id)
+    if not existing:
+        existing = find_employee_by_name(full_name)
+
+    if existing:
+        update_fields = dict(fields)
+        # Link manually-created records to TimeMoto on first match by name.
+        if user_id and not existing.get("timemoto_user_id"):
+            update_fields["timemoto_user_id"] = user_id
+
+        result = (
+            supabase.table("employees")
+            .update(update_fields)
+            .eq("id", existing["id"])
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else existing
+
+    insert_fields = dict(fields)
+    insert_fields["timemoto_user_id"] = user_id
+    insert_fields["is_active"] = True
+
+    result = supabase.table("employees").insert(insert_fields).execute()
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def get_open_session(employee_id):
+    result = (
+        supabase.table("attendance_sessions")
+        .select("id, clock_in_time")
+        .eq("employee_id", employee_id)
+        .is_("clock_out_time", "null")
+        .order("clock_in_time", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def close_open_sessions(employee_id, clock_out_iso):
+    """Close any dangling open sessions for an employee (e.g. a missed Out)."""
+    result = (
+        supabase.table("attendance_sessions")
+        .select("id, clock_in_time")
+        .eq("employee_id", employee_id)
+        .is_("clock_out_time", "null")
+        .execute()
+    )
+
+    clock_out_dt = parse_timestamp(clock_out_iso)
+
+    for row in result.data or []:
+        clock_in_dt = parse_timestamp(row.get("clock_in_time"))
+        duration = None
+        if clock_in_dt and clock_out_dt:
+            duration = int((clock_out_dt - clock_in_dt).total_seconds() // 60)
+
+        supabase.table("attendance_sessions").update(
+            {
+                "clock_out_time": clock_out_iso,
+                "duration_minutes": duration,
+            }
+        ).eq("id", row["id"]).execute()
+
+
+def set_attendance_status(employee_id, on_shift, clock_in_iso, clock_out_iso, now_iso):
+    supabase.table("attendance_status").upsert(
+        {
+            "employee_id": employee_id,
+            "on_shift": on_shift,
+            "clock_in_time": clock_in_iso,
+            "clock_out_time": clock_out_iso,
+            "last_event_time": now_iso,
+        },
+        on_conflict="employee_id",
+    ).execute()
+
+
+# --------------------------------------------------------------------------- #
+# Routes
+# --------------------------------------------------------------------------- #
+
 @flask_app.route("/", methods=["GET"])
 def home():
     return jsonify({"ok": True, "service": "staff-control-bot"})
@@ -89,44 +230,110 @@ def timemoto_webhook():
     event = payload.get("event")
     data = payload.get("data", {})
 
-    employee = data.get("userFullName", "Unknown")
+    if event != "attendance.inserted":
+        return jsonify({"ok": True, "skipped": "event"})
+
+    user_id = data.get("userId")
+    employee_number = data.get("userEmployeeNumber")
+    full_name = data.get("userFullName", "Unknown")
     department = data.get("departmentName", "")
+    location = data.get("locationName", "")
     clock_type = data.get("clockingType", "")
     time_logged = data.get("timeLogged", "")
 
-    try:
-        time_display = datetime.fromisoformat(
-            time_logged.replace("Z", "")
-        ).strftime("%H:%M")
-    except Exception:
-        time_display = time_logged
+    clock_dt = parse_timestamp(time_logged) or datetime.now(timezone.utc)
+    clock_iso = clock_dt.isoformat()
+    time_display = clock_dt.strftime("%H:%M")
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    if event == "attendance.inserted":
+    employee = upsert_employee(
+        user_id=user_id,
+        full_name=full_name,
+        employee_number=employee_number,
+        department=department,
+        location=location,
+    )
+    if not employee:
+        send_telegram_message(
+            f"⚠️ TimeMoto: не удалось сохранить сотрудника «{full_name}»."
+        )
+        return jsonify({"ok": False, "error": "employee_upsert_failed"})
 
-        if clock_type == "In":
+    employee_id = employee["id"]
 
-            text = (
-                f"🟢 Приход\n\n"
-                f"👤 {employee}\n"
-                f"🏢 {department}\n"
-                f"🕒 {time_display}"
+    if clock_type == "In":
+
+        # Close any stale open session before opening a new one.
+        close_open_sessions(employee_id, clock_iso)
+
+        supabase.table("attendance_sessions").insert(
+            {
+                "employee_id": employee_id,
+                "clock_in_time": clock_iso,
+                "source": "timemoto",
+            }
+        ).execute()
+
+        set_attendance_status(
+            employee_id=employee_id,
+            on_shift=True,
+            clock_in_iso=clock_iso,
+            clock_out_iso=None,
+            now_iso=now_iso,
+        )
+
+        send_telegram_message(
+            f"🟢 Приход\n\n"
+            f"👤 {full_name}\n"
+            f"🏢 {department}\n"
+            f"🕒 {time_display}"
+        )
+
+    elif clock_type == "Out":
+
+        session = get_open_session(employee_id)
+
+        set_attendance_status(
+            employee_id=employee_id,
+            on_shift=False,
+            clock_in_iso=(session or {}).get("clock_in_time"),
+            clock_out_iso=clock_iso,
+            now_iso=now_iso,
+        )
+
+        if not session:
+            send_telegram_message(
+                f"⚠️ TimeMoto: для «{full_name}» не найдена открытая смена, "
+                f"уход зафиксирован без длительности."
             )
+            return jsonify({"ok": True, "warning": "no_open_session"})
 
-            send_telegram_message(text)
+        clock_in_dt = parse_timestamp(session.get("clock_in_time"))
+        duration_minutes = None
+        if clock_in_dt:
+            duration_minutes = int((clock_dt - clock_in_dt).total_seconds() // 60)
 
-        elif clock_type == "Out":
+        supabase.table("attendance_sessions").update(
+            {
+                "clock_out_time": clock_iso,
+                "duration_minutes": duration_minutes,
+            }
+        ).eq("id", session["id"]).execute()
 
-            text = (
-                f"🔴 Уход\n\n"
-                f"👤 {employee}\n"
-                f"🏢 {department}\n"
-                f"🕒 {time_display}"
-            )
-
-            send_telegram_message(text)
+        send_telegram_message(
+            f"🔴 Уход\n\n"
+            f"👤 {full_name}\n"
+            f"🏢 {department}\n"
+            f"🕒 {time_display}\n"
+            f"⏱ {fmt_duration(duration_minutes)}"
+        )
 
     return jsonify({"ok": True})
 
+
+# --------------------------------------------------------------------------- #
+# Telegram UI
+# --------------------------------------------------------------------------- #
 
 def build_calendar(year: int, month: int):
     month_name = calendar.month_name[month]
