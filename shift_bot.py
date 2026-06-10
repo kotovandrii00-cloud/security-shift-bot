@@ -80,21 +80,50 @@ def home():
 
 @flask_app.route("/timemoto", methods=["GET", "POST"])
 def timemoto_webhook():
+
     if request.method == "GET":
-        return jsonify({"ok": True, "message": "TimeMoto endpoint is active"})
+        return jsonify({"ok": True})
 
-    data = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True) or {}
 
-    print("TIMEMOTO WEBHOOK RECEIVED:")
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    event = payload.get("event")
+    data = payload.get("data", {})
 
-    text = "📩 TimeMoto webhook received\n\n"
-    text += json.dumps(data, ensure_ascii=False, indent=2)[:3500]
+    employee = data.get("userFullName", "Unknown")
+    department = data.get("departmentName", "")
+    clock_type = data.get("clockingType", "")
+    time_logged = data.get("timeLogged", "")
 
     try:
-        send_telegram_message(text)
-    except Exception as e:
-        print("Telegram send error:", e)
+        time_display = datetime.fromisoformat(
+            time_logged.replace("Z", "")
+        ).strftime("%H:%M")
+    except Exception:
+        time_display = time_logged
+
+    if event == "attendance.inserted":
+
+        if clock_type == "In":
+
+            text = (
+                f"🟢 Приход\n\n"
+                f"👤 {employee}\n"
+                f"🏢 {department}\n"
+                f"🕒 {time_display}"
+            )
+
+            send_telegram_message(text)
+
+        elif clock_type == "Out":
+
+            text = (
+                f"🔴 Уход\n\n"
+                f"👤 {employee}\n"
+                f"🏢 {department}\n"
+                f"🕒 {time_display}"
+            )
+
+            send_telegram_message(text)
 
     return jsonify({"ok": True})
 
