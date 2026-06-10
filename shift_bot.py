@@ -1,3 +1,5 @@
+import threading
+from flask import Flask, request, jsonify
 import os
 import calendar
 from datetime import datetime, date, time, timedelta, timezone
@@ -17,6 +19,33 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+flask_app = Flask(__name__)
+
+@flask_app.route("/timemoto", methods=["POST"])
+def timemoto_webhook():
+    data = request.get_json(silent=True) or {}
+
+    print("TIMEMOTO WEBHOOK RECEIVED:")
+    print(data)
+
+    try:
+        import requests
+
+        text = "📩 TimeMoto webhook received\n\n"
+        text += str(data)[:3000]
+
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": GROUP_ID,
+                "text": text
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram send error:", e)
+
+    return jsonify({"ok": True})
 
 
 def is_allowed(update: Update) -> bool:
@@ -214,6 +243,12 @@ def main():
     app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CallbackQueryHandler(button_handler))
+    
+def run_flask():
+    port = int(os.getenv("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_flask, daemon=True).start()
 
     app.run_polling()
 
