@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -45,6 +46,12 @@ logger = logging.getLogger("shift_bot")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 flask_app = Flask(__name__)
+
+RU_MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
 def is_allowed(update: Update) -> bool:
@@ -109,6 +116,19 @@ def day_bounds_utc(selected_date):
         local_start.astimezone(timezone.utc).isoformat(),
         local_end.astimezone(timezone.utc).isoformat(),
     )
+
+
+def range_bounds_utc(date_from, date_to):
+    """Return [start, end) covering local days date_from..date_to (inclusive)."""
+    start = day_bounds_utc(date_from.isoformat())[0]
+    end = day_bounds_utc(date_to.isoformat())[1]
+    return start, end
+
+
+def fmt_period(date_from, date_to):
+    if date_from == date_to:
+        return date_from.strftime("%d.%m.%Y")
+    return f"{date_from.strftime('%d.%m')} — {date_to.strftime('%d.%m.%Y')}"
 
 
 # --------------------------------------------------------------------------- #
@@ -237,8 +257,58 @@ def set_attendance_status(employee_id, on_shift, clock_in_iso, clock_out_iso, no
     ).execute()
 
 
+def fetch_on_shift():
+    result = (
+        supabase.table("attendance_status")
+        .select("clock_in_time, employees(full_name, position, location)")
+        .eq("on_shift", True)
+        .order("clock_in_time")
+        .execute()
+    )
+    return result.data or []
+
+
+def fetch_sessions(start_utc, end_utc):
+    result = (
+        supabase.table("attendance_sessions")
+        .select(
+            "clock_in_time, clock_out_time, duration_minutes, "
+            "employees(full_name, location)"
+        )
+        .gte("clock_in_time", start_utc)
+        .lt("clock_in_time", end_utc)
+        .order("clock_in_time")
+        .execute()
+    )
+    return result.data or []
+
+
+def fetch_clockins(start_utc, end_utc):
+    result = (
+        supabase.table("attendance_sessions")
+        .select("clock_in_time, employees(full_name, location)")
+        .gte("clock_in_time", start_utc)
+        .lt("clock_in_time", end_utc)
+        .order("clock_in_time", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
+def fetch_clockouts(start_utc, end_utc):
+    result = (
+        supabase.table("attendance_sessions")
+        .select("clock_out_time, duration_minutes, employees(full_name)")
+        .gte("clock_out_time", start_utc)
+        .lt("clock_out_time", end_utc)
+        .order("clock_out_time", desc=True)
+        .execute()
+    )
+    return result.data or []
+
+
 # --------------------------------------------------------------------------- #
-# Routes
+# Webhook (TimeMoto -> Supabase + Telegram)
 # --------------------------------------------------------------------------- #
 
 @flask_app.route("/", methods=["GET"])
@@ -374,203 +444,330 @@ def timemoto_webhook():
 
 
 # --------------------------------------------------------------------------- #
-# Telegram UI
+# Telegram UI — keyboards
 # --------------------------------------------------------------------------- #
 
-def build_calendar(year: int, month: int):
-    month_name = calendar.month_name[month]
-
-    keyboard = [
-        [InlineKeyboardButton(f"{month_name} {year}", callback_data="ignore")]
-    ]
-
-    keyboard.append(
+def main_menu_kb():
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("Mon", callback_data="ignore"),
-            InlineKeyboardButton("Tue", callback_data="ignore"),
-            InlineKeyboardButton("Wed", callback_data="ignore"),
-            InlineKeyboardButton("Thu", callback_data="ignore"),
-            InlineKeyboardButton("Fri", callback_data="ignore"),
-            InlineKeyboardButton("Sat", callback_data="ignore"),
-            InlineKeyboardButton("Sun", callback_data="ignore"),
+            [InlineKeyboardButton("👮 Кто на смене", callback_data="who")],
+            [
+                InlineKeyboardButton("📅 История", callback_data="history"),
+                InlineKeyboardButton("📊 Отчёт", callback_data="report"),
+            ],
+            [
+                InlineKeyboardButton("🟢 Приходы", callback_data="clockins"),
+                InlineKeyboardButton("🔴 Уходы", callback_data="clockouts"),
+            ],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh")],
         ]
     )
 
-    cal = calendar.Calendar(firstweekday=0)
 
+def back_kb(target="menu", label="⬅️ Назад"):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=target)]]
+    )
+
+
+def history_menu_kb():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📅 Сегодня", callback_data="hist:today"),
+                InlineKeyboardButton("📅 Вчера", callback_data="hist:yesterday"),
+            ],
+            [InlineKeyboardButton("📅 Последние 7 дней", callback_data="hist:7d")],
+            [InlineKeyboardButton("📅 Этот месяц", callback_data="hist:month")],
+            [InlineKeyboardButton("📅 Выбрать дату", callback_data="hist:pick")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+        ]
+    )
+
+
+def calendar_kb(year, month):
+    prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+
+    keyboard = [
+        [
+            InlineKeyboardButton("◀️", callback_data=f"cal:{prev_year}:{prev_month}"),
+            InlineKeyboardButton(f"{RU_MONTHS[month - 1]} {year}", callback_data="ignore"),
+            InlineKeyboardButton("▶️", callback_data=f"cal:{next_year}:{next_month}"),
+        ],
+        [InlineKeyboardButton(d, callback_data="ignore") for d in RU_WEEKDAYS],
+    ]
+
+    today = today_local()
+    cal = calendar.Calendar(firstweekday=0)
     for week in cal.monthdayscalendar(year, month):
         row = []
         for day in week:
             if day == 0:
-                row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+                row.append(InlineKeyboardButton("·", callback_data="ignore"))
             else:
-                selected_date = f"{year}-{month:02d}-{day:02d}"
-                row.append(
-                    InlineKeyboardButton(
-                        str(day),
-                        callback_data=f"history:{selected_date}",
-                    )
-                )
+                iso = f"{year}-{month:02d}-{day:02d}"
+                label = f"[{day}]" if (year, month, day) == (today.year, today.month, today.day) else str(day)
+                row.append(InlineKeyboardButton(label, callback_data=f"day:{iso}"))
         keyboard.append(row)
-
-    prev_month = month - 1 or 12
-    prev_year = year if month > 1 else year - 1
-
-    next_month = month + 1 if month < 12 else 1
-    next_year = year if month < 12 else year + 1
 
     keyboard.append(
         [
-            InlineKeyboardButton("◀️", callback_data=f"cal:{prev_year}:{prev_month}"),
-            InlineKeyboardButton("Today", callback_data=f"history:{today_local().isoformat()}"),
-            InlineKeyboardButton("▶️", callback_data=f"cal:{next_year}:{next_month}"),
+            InlineKeyboardButton("📅 Сегодня", callback_data=f"day:{today.isoformat()}"),
+            InlineKeyboardButton("⬅️ Назад", callback_data="history"),
         ]
     )
-
     return InlineKeyboardMarkup(keyboard)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Staff Control Bot работает\n\n"
-        "Команды:\n"
-        "/who — кто сейчас на работе\n"
-        "/shift — кто сейчас на работе\n"
-        "/report — отчёт за сегодня\n"
-        "/history — календарь истории"
+def day_result_kb(d):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⬅️ К календарю", callback_data=f"cal:{d.year}:{d.month}"),
+                InlineKeyboardButton("🏠 Меню", callback_data="menu"),
+            ]
+        ]
     )
 
 
-async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("⛔ Нет доступа.")
-        return
+# --------------------------------------------------------------------------- #
+# Telegram UI — text builders (unified style)
+# --------------------------------------------------------------------------- #
 
-    result = (
-        supabase.table("attendance_status")
-        .select("clock_in_time, employees(full_name, position, location)")
-        .eq("on_shift", True)
-        .execute()
+def menu_text():
+    return (
+        "🛡 Security Shift Bot\n"
+        "━━━━━━━━━━━━━━\n"
+        "Выберите раздел 👇\n\n"
+        f"🕒 Обновлено: {datetime.now(APP_TZ).strftime('%H:%M:%S')}"
     )
 
-    data = result.data or []
 
-    if not data:
-        await update.message.reply_text("🔴 Сейчас никто не отмечен на работе.")
-        return
+def build_who_text():
+    rows = fetch_on_shift()
+    if not rows:
+        return "🟢 Сейчас на работе\n━━━━━━━━━━━━━━\nСейчас никто не отмечен на смене."
 
-    text = f"🟢 Сейчас на работе: {len(data)}\n\n"
-
-    for item in data:
-        employee = item.get("employees") or {}
-        name = employee.get("full_name", "Без имени")
-        location = employee.get("location") or ""
+    text = f"🟢 Сейчас на работе: {len(rows)}\n━━━━━━━━━━━━━━\n"
+    for item in rows:
+        emp = item.get("employees") or {}
+        name = emp.get("full_name", "Без имени")
+        position = emp.get("position") or ""
+        location = emp.get("location") or ""
         clock_in = fmt_time(item.get("clock_in_time"))
 
-        text += f"• {name} — с {clock_in}"
+        text += f"\n• {name}"
+        if position:
+            text += f" — {position}"
+        text += f"\n   🕒 с {clock_in}"
         if location:
-            text += f" | {location}"
+            text += f" · 📍 {location}"
         text += "\n"
+    return text.rstrip()
 
-    await update.message.reply_text(text)
+
+def build_history_text(date_from, date_to, title):
+    start_utc, end_utc = range_bounds_utc(date_from, date_to)
+    rows = fetch_sessions(start_utc, end_utc)
+    period = fmt_period(date_from, date_to)
+
+    if not rows:
+        return f"{title}\n📅 {period}\n━━━━━━━━━━━━━━\nНет записей за этот период."
+
+    text = f"{title}\n📅 {period}\n━━━━━━━━━━━━━━\n"
+    for item in rows:
+        emp = item.get("employees") or {}
+        name = emp.get("full_name", "Без имени")
+        location = emp.get("location") or ""
+        clock_in = fmt_time(item.get("clock_in_time"))
+        clock_out = fmt_time(item.get("clock_out_time"))
+        duration = fmt_duration(item.get("duration_minutes"))
+
+        text += f"\n• {name}\n   {clock_in} → {clock_out} · ⏱ {duration}"
+        if location:
+            text += f"\n   📍 {location}"
+        text += "\n"
+    return text.rstrip()
 
 
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("⛔ Нет доступа.")
-        return
+def build_clockins_text():
+    start_utc, end_utc = day_bounds_utc(today_local().isoformat())
+    rows = fetch_clockins(start_utc, end_utc)
 
-    await send_history_for_date(
-        update=update,
-        context=context,
-        selected_date=today_local().isoformat(),
-        title="📋 Отчёт за сегодня",
+    if not rows:
+        return "🟢 Приходы за сегодня\n━━━━━━━━━━━━━━\nСегодня приходов не было."
+
+    text = f"🟢 Приходы за сегодня: {len(rows)}\n━━━━━━━━━━━━━━\n"
+    for item in rows:
+        emp = item.get("employees") or {}
+        name = emp.get("full_name", "Без имени")
+        location = emp.get("location") or ""
+        clock_in = fmt_time(item.get("clock_in_time"))
+        text += f"\n• {name} — 🕒 {clock_in}"
+        if location:
+            text += f" · 📍 {location}"
+    return text
+
+
+def build_clockouts_text():
+    start_utc, end_utc = day_bounds_utc(today_local().isoformat())
+    rows = fetch_clockouts(start_utc, end_utc)
+
+    if not rows:
+        return "🔴 Уходы за сегодня\n━━━━━━━━━━━━━━\nСегодня уходов не было."
+
+    text = f"🔴 Уходы за сегодня: {len(rows)}\n━━━━━━━━━━━━━━\n"
+    for item in rows:
+        emp = item.get("employees") or {}
+        name = emp.get("full_name", "Без имени")
+        clock_out = fmt_time(item.get("clock_out_time"))
+        duration = fmt_duration(item.get("duration_minutes"))
+        text += f"\n• {name} — 🕒 {clock_out} · ⏱ {duration}"
+    return text
+
+
+def build_settings_text():
+    return (
+        "⚙️ Настройки\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🕒 Часовой пояс: {APP_TZ}\n"
+        f"💬 ID группы: {GROUP_ID}\n"
+        "🔗 Источник отметок: TimeMoto\n\n"
+        "Часовой пояс меняется переменной окружения TIMEZONE."
     )
 
 
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --------------------------------------------------------------------------- #
+# Telegram UI — handlers
+# --------------------------------------------------------------------------- #
+
+async def render(update: Update, text: str, keyboard: InlineKeyboardMarkup):
+    """Edit the message in place for callbacks, or send a new one for commands."""
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.edit_message_text(text, reply_markup=keyboard)
+            return
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+        except Exception:
+            logger.exception("edit_message_text failed; sending a new message")
+        await query.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа.")
         return
+    await update.message.reply_text(menu_text(), reply_markup=main_menu_kb())
 
-    today = today_local()
 
+async def who_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    await update.message.reply_text(build_who_text(), reply_markup=back_kb())
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    d = today_local()
     await update.message.reply_text(
-        "📅 Выберите дату:",
-        reply_markup=build_calendar(today.year, today.month),
+        build_history_text(d, d, "📊 Отчёт за сегодня"), reply_markup=back_kb()
     )
 
 
-async def send_history_for_date(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    selected_date: str,
-    title: str = "📅 История",
-):
-    start_dt, end_dt = day_bounds_utc(selected_date)
-
-    result = (
-        supabase.table("attendance_sessions")
-        .select(
-            "clock_in_time, clock_out_time, duration_minutes, "
-            "employees(full_name, location)"
-        )
-        .gte("clock_in_time", start_dt)
-        .lt("clock_in_time", end_dt)
-        .order("clock_in_time")
-        .execute()
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    await update.message.reply_text(
+        "📅 История\n━━━━━━━━━━━━━━\nВыберите период:",
+        reply_markup=history_menu_kb(),
     )
 
-    data = result.data or []
 
-    if not data:
-        message = f"📅 {selected_date}\n\nНет записей за эту дату."
-    else:
-        message = f"{title}\n{selected_date}\n\n"
-
-        for item in data:
-            employee = item.get("employees") or {}
-            name = employee.get("full_name", "Без имени")
-            location = employee.get("location") or ""
-            clock_in = fmt_time(item.get("clock_in_time"))
-            clock_out = fmt_time(item.get("clock_out_time"))
-            duration = fmt_duration(item.get("duration_minutes"))
-
-            message += f"• {name}\n"
-            if location:
-                message += f"  📍 {location}\n"
-            message += f"  {clock_in} → {clock_out}\n"
-            message += f"  ⏱ {duration}\n\n"
-
-    if update.callback_query:
-        await update.callback_query.message.reply_text(message)
-    else:
-        await update.message.reply_text(message)
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    callback_data = query.data
-
-    if callback_data == "ignore":
+    if not is_allowed(update):
+        await query.edit_message_text("⛔ Нет доступа.")
         return
 
-    if callback_data.startswith("cal:"):
-        _, year, month = callback_data.split(":")
-        await query.edit_message_reply_markup(
-            reply_markup=build_calendar(int(year), int(month))
+    data = query.data or ""
+
+    if data == "ignore":
+        return
+
+    if data in ("menu", "refresh"):
+        await render(update, menu_text(), main_menu_kb())
+        return
+
+    if data == "who":
+        await render(update, build_who_text(), back_kb())
+        return
+
+    if data == "report":
+        d = today_local()
+        await render(update, build_history_text(d, d, "📊 Отчёт за сегодня"), back_kb())
+        return
+
+    if data == "clockins":
+        await render(update, build_clockins_text(), back_kb())
+        return
+
+    if data == "clockouts":
+        await render(update, build_clockouts_text(), back_kb())
+        return
+
+    if data == "settings":
+        await render(update, build_settings_text(), back_kb())
+        return
+
+    if data == "history":
+        await render(
+            update,
+            "📅 История\n━━━━━━━━━━━━━━\nВыберите период:",
+            history_menu_kb(),
         )
         return
 
-    if callback_data.startswith("history:"):
-        _, selected_date = callback_data.split(":")
-        await send_history_for_date(
-            update=update,
-            context=context,
-            selected_date=selected_date,
-        )
+    if data.startswith("hist:"):
+        kind = data.split(":", 1)[1]
+        today = today_local()
+
+        if kind == "today":
+            await render(update, build_history_text(today, today, "📅 История · сегодня"), back_kb("history"))
+        elif kind == "yesterday":
+            y = today - timedelta(days=1)
+            await render(update, build_history_text(y, y, "📅 История · вчера"), back_kb("history"))
+        elif kind == "7d":
+            await render(update, build_history_text(today - timedelta(days=6), today, "📅 История · последние 7 дней"), back_kb("history"))
+        elif kind == "month":
+            first = today.replace(day=1)
+            await render(update, build_history_text(first, today, "📅 История · этот месяц"), back_kb("history"))
+        elif kind == "pick":
+            await render(update, "📅 Выберите дату:", calendar_kb(today.year, today.month))
+        return
+
+    if data.startswith("cal:"):
+        _, year, month = data.split(":")
+        await render(update, "📅 Выберите дату:", calendar_kb(int(year), int(month)))
+        return
+
+    if data.startswith("day:"):
+        iso = data.split(":", 1)[1]
+        d = datetime.fromisoformat(iso).date()
+        await render(update, build_history_text(d, d, "📅 История"), day_result_kb(d))
+        return
 
 
 def run_flask():
@@ -582,11 +779,12 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("who", who))
-    app.add_handler(CommandHandler("shift", who))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("menu", start))
+    app.add_handler(CommandHandler("who", who_cmd))
+    app.add_handler(CommandHandler("shift", who_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     threading.Thread(target=run_flask, daemon=True).start()
 
