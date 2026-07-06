@@ -16,16 +16,14 @@ DAY_HEADERS = [
     "Дата",
     "Приход",
     "Уход",
-    "Часы",
-    "Статус",
-    "Источник",
+    "Отработано",
 ]
 
 SUMMARY_HEADERS = [
     "Отдел",
     "Сотрудник",
     "Смен",
-    "Часы за месяц",
+    "Отработано за месяц",
 ]
 
 SCOPES = [
@@ -72,6 +70,37 @@ def month_bounds(selected_date):
 
 def worksheet_title_for_a1(title):
     return "'" + title.replace("'", "''") + "'"
+
+
+def fmt_duration_label(minutes):
+    if minutes is None:
+        return ""
+    minutes = int(minutes)
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}ч {mins:02d}м"
+
+
+def parse_duration_label(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace(",", ".").lower()
+    if "ч" in normalized:
+        hours_part, _, rest = normalized.partition("ч")
+        mins_part = rest.replace("м", "").strip() or "0"
+        try:
+            return int(float(hours_part.strip()) * 60) + int(float(mins_part))
+        except ValueError:
+            return None
+
+    try:
+        return int(float(normalized) * 60)
+    except ValueError:
+        return None
 
 
 def build_credentials():
@@ -234,6 +263,7 @@ class GoogleSheetsSync:
     def _format_table(self, spreadsheet_id, sheet_id, row_count, col_count, open_row_indexes=None):
         _, sheets = self._services()
         open_row_indexes = open_row_indexes or []
+        reset_rows = max(row_count, 2)
         requests = [
             {
                 "updateSheetProperties": {
@@ -249,16 +279,16 @@ class GoogleSheetsSync:
                     "range": {
                         "sheetId": sheet_id,
                         "startRowIndex": 0,
-                        "endRowIndex": 1,
+                        "endRowIndex": reset_rows,
                         "startColumnIndex": 0,
-                        "endColumnIndex": col_count,
+                        "endColumnIndex": 26,
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.12, "green": 0.22, "blue": 0.36},
+                            "backgroundColor": {"red": 1, "green": 1, "blue": 1},
                             "textFormat": {
-                                "bold": True,
-                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                                "bold": False,
+                                "foregroundColor": {"red": 0, "green": 0, "blue": 0},
                             },
                         }
                     },
@@ -269,8 +299,8 @@ class GoogleSheetsSync:
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,
-                        "endRowIndex": max(row_count, 2),
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
                         "startColumnIndex": 0,
                         "endColumnIndex": col_count,
                     },
@@ -278,7 +308,7 @@ class GoogleSheetsSync:
                         "userEnteredFormat": {
                             "backgroundColor": {"red": 1, "green": 1, "blue": 1},
                             "textFormat": {
-                                "bold": False,
+                                "bold": True,
                                 "foregroundColor": {"red": 0, "green": 0, "blue": 0},
                             },
                         }
@@ -310,27 +340,6 @@ class GoogleSheetsSync:
                 }
             },
         ]
-
-        if row_count > 1:
-            requests.append(
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 1,
-                            "endRowIndex": row_count,
-                            "startColumnIndex": 5,
-                            "endColumnIndex": 6,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "numberFormat": {"type": "NUMBER", "pattern": "0.00"}
-                            }
-                        },
-                        "fields": "userEnteredFormat.numberFormat",
-                    }
-                }
-            )
 
         for row_index in open_row_indexes:
             requests.append(
@@ -378,11 +387,7 @@ class GoogleSheetsSync:
         clock_out = clock_out_dt.astimezone(self.app_tz).strftime("%H:%M") if clock_out_dt else ""
 
         duration = item.get("duration_minutes")
-        hours = round(int(duration) / 60, 2) if duration is not None else ""
-        source = item.get("source") or ""
-        status = "Открыта" if not clock_out else "Закрыта"
-        if source == "timemoto_auto_8h":
-            status = "Авто 8ч"
+        duration_label = fmt_duration_label(duration)
 
         return [
             department,
@@ -390,9 +395,7 @@ class GoogleSheetsSync:
             selected_date.strftime("%d.%m.%Y"),
             clock_in,
             clock_out,
-            hours,
-            status,
-            source,
+            duration_label,
         ]
 
     def sync_day(self, selected_date, sessions):
@@ -409,7 +412,7 @@ class GoogleSheetsSync:
         open_rows = [
             idx + 1
             for idx, row in enumerate(rows)
-            if row[6] == "Открыта"
+            if not row[4]
         ]
 
         self._write_values(spreadsheet_id, title, values)
@@ -442,7 +445,7 @@ class GoogleSheetsSync:
                 department,
                 employee,
                 data["shifts"],
-                round(data["minutes"] / 60, 2),
+                fmt_duration_label(data["minutes"]),
             ])
         rows.sort(key=lambda row: (row[0].lower(), row[1].lower()))
 
@@ -456,7 +459,7 @@ class GoogleSheetsSync:
         a1_title = worksheet_title_for_a1(title)
         result = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{a1_title}!A:H",
+            range=f"{a1_title}!A:F",
         ).execute()
         return result.get("values", [])
 
@@ -480,27 +483,22 @@ class GoogleSheetsSync:
         rows = []
         for row in values[1:]:
             padded = row + [""] * (len(DAY_HEADERS) - len(row))
-            hours = padded[5]
-            duration_minutes = None
-            if hours:
-                try:
-                    duration_minutes = int(float(str(hours).replace(",", ".")) * 60)
-                except ValueError:
-                    duration_minutes = None
+            duration_minutes = parse_duration_label(padded[5])
+            clock_out = padded[4]
 
             rows.append(
                 {
                     "clock_in_time": padded[3],
-                    "clock_out_time": padded[4],
+                    "clock_out_time": clock_out,
                     "duration_minutes": duration_minutes,
-                    "source": padded[7],
+                    "source": "google_sheets",
                     "employees": {
                         "full_name": padded[1],
                         "department": padded[0],
                         "position": padded[0],
                         "location": "",
                     },
-                    "status": padded[6],
+                    "status": "Закрыта" if clock_out else "Открыта",
                 }
             )
         return rows
