@@ -103,6 +103,32 @@ def parse_duration_label(value):
         return None
 
 
+def parse_date_label(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip(), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def parse_clock_minutes(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text or ":" not in text:
+        return None
+    hours, _, minutes = text.partition(":")
+    try:
+        return int(hours) * 60 + int(minutes)
+    except ValueError:
+        return None
+
+
+def normalize_name(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+
 def build_credentials():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     raw_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
@@ -137,10 +163,11 @@ class GoogleSheetsSync:
     def __init__(self, app_tz, logger):
         self.app_tz = app_tz
         self.logger = logger
-        self.enabled = env_bool("SHEETS_ENABLED", False)
+        self.enabled = env_bool("SHEETS_ENABLED", True)
         self.folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
         self._drive = None
         self._sheets = None
+        self._layout_ready = set()
 
     def is_ready(self):
         return self.enabled and bool(self.folder_id)
@@ -263,7 +290,7 @@ class GoogleSheetsSync:
     def _format_table(self, spreadsheet_id, sheet_id, row_count, col_count, open_row_indexes=None):
         _, sheets = self._services()
         open_row_indexes = open_row_indexes or []
-        reset_rows = max(row_count, 2)
+        reset_rows = max(row_count + 20, 200)
         requests = [
             {
                 "updateSheetProperties": {
@@ -288,6 +315,7 @@ class GoogleSheetsSync:
                             "backgroundColor": {"red": 1, "green": 1, "blue": 1},
                             "textFormat": {
                                 "bold": False,
+                                "underline": False,
                                 "foregroundColor": {"red": 0, "green": 0, "blue": 0},
                             },
                         }
@@ -309,6 +337,7 @@ class GoogleSheetsSync:
                             "backgroundColor": {"red": 1, "green": 1, "blue": 1},
                             "textFormat": {
                                 "bold": True,
+                                "underline": False,
                                 "foregroundColor": {"red": 0, "green": 0, "blue": 0},
                             },
                         }
@@ -362,6 +391,7 @@ class GoogleSheetsSync:
                                 "textFormat": {
                                     "foregroundColor": {"red": 1, "green": 1, "blue": 1},
                                     "bold": True,
+                                    "underline": False,
                                 },
                             }
                         },
@@ -374,6 +404,338 @@ class GoogleSheetsSync:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
+
+    def _sheet_id(self, spreadsheet_id, title):
+        meta = self._spreadsheet_meta(spreadsheet_id)
+        for item in meta.get("sheets", []):
+            props = item["properties"]
+            if props["title"] == title:
+                return props["sheetId"]
+        return None
+
+    def _sheet_ids_by_title(self, spreadsheet_id):
+        meta = self._spreadsheet_meta(spreadsheet_id)
+        return {
+            item["properties"]["title"]: item["properties"]["sheetId"]
+            for item in meta.get("sheets", [])
+        }
+
+    def _ensure_headers(self, spreadsheet_id, title, headers):
+        sheet_id = self._ensure_sheet(spreadsheet_id, title)
+        values = self._read_values(spreadsheet_id, title)
+        if values:
+            return sheet_id
+        self._write_values(spreadsheet_id, title, [headers])
+        self._format_table(spreadsheet_id, sheet_id, 1, len(headers))
+        return sheet_id
+
+    def ensure_month_layout(self, selected_date):
+        if not self.is_ready():
+            return None
+
+        spreadsheet_id = self._find_or_create_spreadsheet(selected_date)
+        cache_key = month_file_name(selected_date)
+        if cache_key in self._layout_ready:
+            return spreadsheet_id
+
+        self._ensure_headers(spreadsheet_id, "Итог месяца", SUMMARY_HEADERS)
+
+        first_day, last_day = month_bounds(selected_date)
+        current = first_day
+        while current <= last_day:
+            self._ensure_headers(spreadsheet_id, day_sheet_name(current), DAY_HEADERS)
+            current += timedelta(days=1)
+
+        self._layout_ready.add(cache_key)
+        return spreadsheet_id
+
+    def _normalize_day_rows(self, selected_date, rows):
+        date_label = selected_date.strftime("%d.%m.%Y")
+        normalized = []
+        for row in rows:
+            padded = (row + [""] * len(DAY_HEADERS))[:len(DAY_HEADERS)]
+            if not any(str(cell).strip() for cell in padded):
+                continue
+            if not padded[2]:
+                padded[2] = date_label
+            normalized.append(padded)
+        normalized.sort(key=lambda row: (
+            str(row[0]).lower(),
+            str(row[1]).lower(),
+            str(row[3]),
+            str(row[4]),
+        ))
+        return normalized
+
+    def _values_to_day_rows(self, values):
+        if len(values) <= 1:
+            return []
+
+        rows = []
+        for row in values[1:]:
+            padded = (row + [""] * len(DAY_HEADERS))[:len(DAY_HEADERS)]
+            if any(str(cell).strip() for cell in padded):
+                rows.append(padded)
+        return rows
+
+    def _read_day_rows_in_spreadsheet(self, spreadsheet_id, titles, selected_date):
+        title = day_sheet_name(selected_date)
+        sheet_id = titles.get(title)
+        if not sheet_id:
+            return None, []
+
+        values = self._read_values(spreadsheet_id, title)
+        return sheet_id, self._values_to_day_rows(values)
+
+    def _read_day_rows(self, selected_date, create=False):
+        spreadsheet_id = (
+            self.ensure_month_layout(selected_date)
+            if create else self._find_spreadsheet(selected_date)
+        )
+        if not spreadsheet_id:
+            return None, None, []
+
+        title = day_sheet_name(selected_date)
+        if create:
+            sheet_id = self._ensure_sheet(spreadsheet_id, title)
+        else:
+            sheet_id = self._sheet_id(spreadsheet_id, title)
+            if not sheet_id:
+                return spreadsheet_id, None, []
+
+        values = self._read_values(spreadsheet_id, title)
+        return spreadsheet_id, sheet_id, self._values_to_day_rows(values)
+
+    def _write_day_rows(self, selected_date, rows):
+        spreadsheet_id = self.ensure_month_layout(selected_date)
+        title = day_sheet_name(selected_date)
+        sheet_id = self._ensure_sheet(spreadsheet_id, title)
+
+        rows = self._normalize_day_rows(selected_date, rows)
+        values = [DAY_HEADERS] + rows
+        open_rows = [
+            idx + 1
+            for idx, row in enumerate(rows)
+            if not str(row[4]).strip()
+        ]
+
+        self._write_values(spreadsheet_id, title, values)
+        self._format_table(spreadsheet_id, sheet_id, len(values), len(DAY_HEADERS), open_rows)
+        return spreadsheet_id
+
+    def _row_clock_in_dt(self, row):
+        row_date = parse_date_label(row[2])
+        clock_minutes = parse_clock_minutes(row[3])
+        if not row_date or clock_minutes is None:
+            return None
+        return datetime(
+            row_date.year,
+            row_date.month,
+            row_date.day,
+            clock_minutes // 60,
+            clock_minutes % 60,
+            tzinfo=self.app_tz,
+        )
+
+    def _recent_dates(self, end_date, days=31):
+        for offset in range(days):
+            yield end_date - timedelta(days=offset)
+
+    def _close_employee_open_rows(self, employee, close_dt, days_back=31, close_all=True):
+        close_local = close_dt.astimezone(self.app_tz)
+        close_label = close_local.strftime("%H:%M")
+        candidates = []
+        dates_by_month = defaultdict(list)
+        rows_by_date = {}
+
+        for selected_date in self._recent_dates(close_local.date(), days_back):
+            dates_by_month[selected_date.replace(day=1)].append(selected_date)
+
+        for month_date, selected_dates in sorted(dates_by_month.items(), reverse=True):
+            spreadsheet_id = self._find_spreadsheet(month_date)
+            if not spreadsheet_id:
+                continue
+            titles = self._sheet_ids_by_title(spreadsheet_id)
+
+            for selected_date in selected_dates:
+                sheet_id, rows = self._read_day_rows_in_spreadsheet(
+                    spreadsheet_id, titles, selected_date
+                )
+                if not sheet_id or not rows:
+                    continue
+
+                for row in rows:
+                    if normalize_name(row[1]) != normalize_name(employee):
+                        continue
+                    if str(row[4]).strip():
+                        continue
+
+                    clock_in_dt = self._row_clock_in_dt(row)
+                    if not clock_in_dt or clock_in_dt > close_local:
+                        continue
+
+                    rows_by_date[selected_date] = rows
+                    candidates.append((clock_in_dt, selected_date, row))
+
+        candidates.sort(key=lambda item: item[0])
+        targets = candidates if close_all else candidates[-1:]
+        changed_dates = set()
+        closed = []
+
+        for clock_in_dt, selected_date, row in targets:
+            duration = max(0, int((close_local - clock_in_dt).total_seconds() // 60))
+            row[4] = close_label
+            row[5] = fmt_duration_label(duration)
+            changed_dates.add(selected_date)
+            closed.append(
+                {
+                    "date": selected_date,
+                    "clock_in": clock_in_dt,
+                    "clock_out": close_local,
+                    "duration_minutes": duration,
+                }
+            )
+
+        for selected_date in sorted(changed_dates):
+            self._write_day_rows(selected_date, rows_by_date[selected_date])
+
+        closed.sort(key=lambda item: item["clock_in"])
+        return closed
+
+    def record_clock_in(self, clock_dt, full_name, department, location=""):
+        if not self.is_ready():
+            raise RuntimeError("Google Sheets is not configured")
+
+        local_dt = clock_dt.astimezone(self.app_tz)
+        selected_date = local_dt.date()
+        full_name = full_name or "Без имени"
+        department = department or "Без отдела"
+
+        closed = self._close_employee_open_rows(full_name, local_dt)
+        _, _, rows = self._read_day_rows(selected_date, create=True)
+        rows.append([
+            department,
+            full_name,
+            selected_date.strftime("%d.%m.%Y"),
+            local_dt.strftime("%H:%M"),
+            "",
+            "",
+        ])
+        self._write_day_rows(selected_date, rows)
+
+        changed_months = {selected_date.replace(day=1)}
+        changed_months.update(item["date"].replace(day=1) for item in closed)
+        for month_date in sorted(changed_months):
+            self.sync_month_summary_from_sheets(month_date)
+        return None
+
+    def record_clock_out(self, clock_dt, full_name, department="", location=""):
+        if not self.is_ready():
+            raise RuntimeError("Google Sheets is not configured")
+
+        full_name = full_name or "Без имени"
+        closed = self._close_employee_open_rows(full_name, clock_dt, close_all=False)
+        changed_months = {item["date"].replace(day=1) for item in closed}
+        for month_date in sorted(changed_months):
+            self.sync_month_summary_from_sheets(month_date)
+
+        if not closed:
+            self.logger.warning("No open Google Sheets shift found for %s", full_name)
+            return None
+        return closed[-1]["duration_minutes"]
+
+    def auto_close_stale_sessions(self, cutoff_date, auto_minutes):
+        if not self.is_ready():
+            return 0
+
+        first_current, _ = month_bounds(cutoff_date)
+        previous_month_day = first_current - timedelta(days=1)
+        first_previous, _ = month_bounds(previous_month_day)
+        month_starts = sorted({first_previous, first_current})
+
+        closed_count = 0
+        changed_dates = set()
+
+        for month_start in month_starts:
+            spreadsheet_id = self._find_spreadsheet(month_start)
+            if not spreadsheet_id:
+                continue
+            titles = self._sheet_ids_by_title(spreadsheet_id)
+
+            first_day, last_day = month_bounds(month_start)
+            current = first_day
+            while current <= min(last_day, cutoff_date - timedelta(days=1)):
+                sheet_id, rows = self._read_day_rows_in_spreadsheet(
+                    spreadsheet_id, titles, current
+                )
+                if not sheet_id or not rows:
+                    current += timedelta(days=1)
+                    continue
+
+                changed = False
+                for row in rows:
+                    if str(row[4]).strip():
+                        continue
+                    clock_in_dt = self._row_clock_in_dt(row)
+                    if not clock_in_dt:
+                        continue
+
+                    clock_out_dt = clock_in_dt + timedelta(minutes=auto_minutes)
+                    row[4] = clock_out_dt.astimezone(self.app_tz).strftime("%H:%M")
+                    row[5] = fmt_duration_label(auto_minutes)
+                    closed_count += 1
+                    changed = True
+
+                if changed:
+                    self._write_day_rows(current, rows)
+                    changed_dates.add(current)
+                current += timedelta(days=1)
+
+        for month_date in sorted({d.replace(day=1) for d in changed_dates}):
+            self.sync_month_summary_from_sheets(month_date)
+
+        if closed_count:
+            self.logger.info("Auto-closed %s stale Google Sheets shift(s)", closed_count)
+        return closed_count
+
+    def sync_month_summary_from_sheets(self, selected_date):
+        spreadsheet_id = self.ensure_month_layout(selected_date)
+        if not spreadsheet_id:
+            return None
+
+        meta = self._spreadsheet_meta(spreadsheet_id)
+        titles = {
+            item["properties"]["title"]
+            for item in meta.get("sheets", [])
+        }
+
+        first_day, last_day = month_bounds(selected_date)
+        rows = []
+        current = first_day
+        while current <= last_day:
+            title = day_sheet_name(current)
+            if title not in titles:
+                current += timedelta(days=1)
+                continue
+
+            values = self._read_values(spreadsheet_id, title)
+            for row in values[1:]:
+                padded = (row + [""] * len(DAY_HEADERS))[:len(DAY_HEADERS)]
+                if not any(str(cell).strip() for cell in padded):
+                    continue
+                rows.append(
+                    {
+                        "duration_minutes": parse_duration_label(padded[5]),
+                        "employees": {
+                            "full_name": padded[1],
+                            "department": padded[0],
+                            "position": padded[0],
+                            "location": "",
+                        },
+                    }
+                )
+            current += timedelta(days=1)
+        return self.sync_month_summary(selected_date, rows)
 
     def _session_to_day_row(self, selected_date, item):
         emp = item.get("employees") or {}
@@ -491,6 +853,8 @@ class GoogleSheetsSync:
                     "clock_in_time": padded[3],
                     "clock_out_time": clock_out,
                     "duration_minutes": duration_minutes,
+                    "date": padded[2],
+                    "date_label": padded[2],
                     "source": "google_sheets",
                     "employees": {
                         "full_name": padded[1],
