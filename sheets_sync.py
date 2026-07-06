@@ -168,6 +168,8 @@ class GoogleSheetsSync:
         self._drive = None
         self._sheets = None
         self._layout_ready = set()
+        self._spreadsheet_id_cache = {}
+        self._meta_cache = {}
 
     def is_ready(self):
         return self.enabled and bool(self.folder_id)
@@ -195,6 +197,9 @@ class GoogleSheetsSync:
     def _find_spreadsheet(self, selected_date):
         drive, _ = self._services()
         title = month_file_name(selected_date)
+        if title in self._spreadsheet_id_cache:
+            return self._spreadsheet_id_cache[title]
+
         escaped_title = title.replace("\\", "\\\\").replace("'", "\\'")
         query = (
             f"name = '{escaped_title}' "
@@ -210,7 +215,9 @@ class GoogleSheetsSync:
 
         files = result.get("files", [])
         if files:
-            return files[0]["id"]
+            spreadsheet_id = files[0]["id"]
+            self._spreadsheet_id_cache[title] = spreadsheet_id
+            return spreadsheet_id
         return None
 
     def _find_or_create_spreadsheet(self, selected_date):
@@ -229,15 +236,21 @@ class GoogleSheetsSync:
             fields="id",
         ).execute()
         spreadsheet_id = created["id"]
+        self._spreadsheet_id_cache[title] = spreadsheet_id
         self.logger.info("Created Google spreadsheet %s for %s", spreadsheet_id, title)
         return spreadsheet_id
 
-    def _spreadsheet_meta(self, spreadsheet_id):
+    def _spreadsheet_meta(self, spreadsheet_id, refresh=False):
+        if not refresh and spreadsheet_id in self._meta_cache:
+            return self._meta_cache[spreadsheet_id]
+
         _, sheets = self._services()
-        return sheets.spreadsheets().get(
+        meta = sheets.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
             fields="sheets(properties(sheetId,title,index,gridProperties))",
         ).execute()
+        self._meta_cache[spreadsheet_id] = meta
+        return meta
 
     def _ensure_sheet(self, spreadsheet_id, title):
         _, sheets = self._services()
@@ -264,12 +277,14 @@ class GoogleSheetsSync:
                     ]
                 },
             ).execute()
+            self._meta_cache.pop(spreadsheet_id, None)
             return sheet_id
 
         response = sheets.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
         ).execute()
+        self._meta_cache.pop(spreadsheet_id, None)
         return response["replies"][0]["addSheet"]["properties"]["sheetId"]
 
     def _write_values(self, spreadsheet_id, title, values):
@@ -420,6 +435,22 @@ class GoogleSheetsSync:
             for item in meta.get("sheets", [])
         }
 
+    def _read_values_batch(self, spreadsheet_id, titles):
+        if not titles:
+            return {}
+
+        _, sheets = self._services()
+        ranges = [f"{worksheet_title_for_a1(title)}!A:F" for title in titles]
+        result = sheets.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+        ).execute()
+
+        values_by_title = {}
+        for title, value_range in zip(titles, result.get("valueRanges", [])):
+            values_by_title[title] = value_range.get("values", [])
+        return values_by_title
+
     def _ensure_headers(self, spreadsheet_id, title, headers):
         sheet_id = self._ensure_sheet(spreadsheet_id, title)
         values = self._read_values(spreadsheet_id, title)
@@ -438,13 +469,68 @@ class GoogleSheetsSync:
         if cache_key in self._layout_ready:
             return spreadsheet_id
 
-        self._ensure_headers(spreadsheet_id, "Итог месяца", SUMMARY_HEADERS)
-
+        _, sheets = self._services()
+        existing = self._sheet_ids_by_title(spreadsheet_id)
         first_day, last_day = month_bounds(selected_date)
+        desired = [("Итог месяца", SUMMARY_HEADERS)]
         current = first_day
         while current <= last_day:
-            self._ensure_headers(spreadsheet_id, day_sheet_name(current), DAY_HEADERS)
+            desired.append((day_sheet_name(current), DAY_HEADERS))
             current += timedelta(days=1)
+
+        requests = []
+        header_updates = []
+        summary_title, summary_headers = desired[0]
+
+        if summary_title not in existing:
+            if "Sheet1" in existing and len(existing) == 1:
+                sheet_id = existing["Sheet1"]
+                requests.append(
+                    {
+                        "updateSheetProperties": {
+                            "properties": {"sheetId": sheet_id, "title": summary_title},
+                            "fields": "title",
+                        }
+                    }
+                )
+                existing[summary_title] = sheet_id
+                existing.pop("Sheet1", None)
+            else:
+                requests.append({"addSheet": {"properties": {"title": summary_title}}})
+            header_updates.append((summary_title, summary_headers))
+
+        for title, headers in desired[1:]:
+            if title in existing:
+                continue
+            requests.append({"addSheet": {"properties": {"title": title}}})
+            header_updates.append((title, headers))
+
+        if requests:
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests},
+            ).execute()
+            self._meta_cache.pop(spreadsheet_id, None)
+            existing = self._sheet_ids_by_title(spreadsheet_id)
+
+        if header_updates:
+            sheets.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": [
+                        {
+                            "range": f"{worksheet_title_for_a1(title)}!A1",
+                            "values": [headers],
+                        }
+                        for title, headers in header_updates
+                    ],
+                },
+            ).execute()
+            for title, headers in header_updates:
+                sheet_id = existing.get(title)
+                if sheet_id is not None:
+                    self._format_table(spreadsheet_id, sheet_id, 1, len(headers))
 
         self._layout_ready.add(cache_key)
         return spreadsheet_id
@@ -556,11 +642,17 @@ class GoogleSheetsSync:
             if not spreadsheet_id:
                 continue
             titles = self._sheet_ids_by_title(spreadsheet_id)
+            selected_titles = [
+                day_sheet_name(selected_date)
+                for selected_date in selected_dates
+                if day_sheet_name(selected_date) in titles
+            ]
+            values_by_title = self._read_values_batch(spreadsheet_id, selected_titles)
 
             for selected_date in selected_dates:
-                sheet_id, rows = self._read_day_rows_in_spreadsheet(
-                    spreadsheet_id, titles, selected_date
-                )
+                title = day_sheet_name(selected_date)
+                sheet_id = titles.get(title)
+                rows = self._values_to_day_rows(values_by_title.get(title, []))
                 if not sheet_id or not rows:
                     continue
 
@@ -663,13 +755,24 @@ class GoogleSheetsSync:
             titles = self._sheet_ids_by_title(spreadsheet_id)
 
             first_day, last_day = month_bounds(month_start)
+            dates = []
             current = first_day
             while current <= min(last_day, cutoff_date - timedelta(days=1)):
-                sheet_id, rows = self._read_day_rows_in_spreadsheet(
-                    spreadsheet_id, titles, current
-                )
+                dates.append(current)
+                current += timedelta(days=1)
+
+            selected_titles = [
+                day_sheet_name(selected_date)
+                for selected_date in dates
+                if day_sheet_name(selected_date) in titles
+            ]
+            values_by_title = self._read_values_batch(spreadsheet_id, selected_titles)
+
+            for current in dates:
+                title = day_sheet_name(current)
+                sheet_id = titles.get(title)
+                rows = self._values_to_day_rows(values_by_title.get(title, []))
                 if not sheet_id or not rows:
-                    current += timedelta(days=1)
                     continue
 
                 changed = False
@@ -689,7 +792,6 @@ class GoogleSheetsSync:
                 if changed:
                     self._write_day_rows(current, rows)
                     changed_dates.add(current)
-                current += timedelta(days=1)
 
         for month_date in sorted({d.replace(day=1) for d in changed_dates}):
             self.sync_month_summary_from_sheets(month_date)
@@ -711,14 +813,18 @@ class GoogleSheetsSync:
 
         first_day, last_day = month_bounds(selected_date)
         rows = []
+        day_titles = []
         current = first_day
         while current <= last_day:
             title = day_sheet_name(current)
-            if title not in titles:
-                current += timedelta(days=1)
-                continue
+            if title in titles:
+                day_titles.append(title)
+            current += timedelta(days=1)
 
-            values = self._read_values(spreadsheet_id, title)
+        values_by_title = self._read_values_batch(spreadsheet_id, day_titles)
+
+        for title in day_titles:
+            values = values_by_title.get(title, [])
             for row in values[1:]:
                 padded = (row + [""] * len(DAY_HEADERS))[:len(DAY_HEADERS)]
                 if not any(str(cell).strip() for cell in padded):
@@ -734,7 +840,6 @@ class GoogleSheetsSync:
                         },
                     }
                 )
-            current += timedelta(days=1)
         return self.sync_month_summary(selected_date, rows)
 
     def _session_to_day_row(self, selected_date, item):
@@ -825,23 +930,9 @@ class GoogleSheetsSync:
         ).execute()
         return result.get("values", [])
 
-    def day_rows_for_bot(self, selected_date):
-        if not self.is_ready():
-            return []
-        spreadsheet_id = self._find_spreadsheet(selected_date)
-        if not spreadsheet_id:
-            return []
-        meta = self._spreadsheet_meta(spreadsheet_id)
-        titles = {
-            item["properties"]["title"]
-            for item in meta.get("sheets", [])
-        }
-        if day_sheet_name(selected_date) not in titles:
-            return []
-        values = self._read_values(spreadsheet_id, day_sheet_name(selected_date))
+    def _values_to_bot_rows(self, values):
         if len(values) <= 1:
             return []
-
         rows = []
         for row in values[1:]:
             padded = row + [""] * (len(DAY_HEADERS) - len(row))
@@ -867,10 +958,38 @@ class GoogleSheetsSync:
             )
         return rows
 
+    def day_rows_for_bot(self, selected_date):
+        if not self.is_ready():
+            return []
+        spreadsheet_id = self._find_spreadsheet(selected_date)
+        if not spreadsheet_id:
+            return []
+        titles = self._sheet_ids_by_title(spreadsheet_id)
+        title = day_sheet_name(selected_date)
+        if title not in titles:
+            return []
+        values = self._read_values(spreadsheet_id, title)
+        return self._values_to_bot_rows(values)
+
     def range_rows_for_bot(self, date_from, date_to):
         rows = []
+        dates_by_month = defaultdict(list)
         current = date_from
         while current <= date_to:
-            rows.extend(self.day_rows_for_bot(current))
+            dates_by_month[current.replace(day=1)].append(current)
             current += timedelta(days=1)
+
+        for month_date, selected_dates in sorted(dates_by_month.items()):
+            spreadsheet_id = self._find_spreadsheet(month_date)
+            if not spreadsheet_id:
+                continue
+            titles = self._sheet_ids_by_title(spreadsheet_id)
+            selected_titles = [
+                day_sheet_name(selected_date)
+                for selected_date in selected_dates
+                if day_sheet_name(selected_date) in titles
+            ]
+            values_by_title = self._read_values_batch(spreadsheet_id, selected_titles)
+            for title in selected_titles:
+                rows.extend(self._values_to_bot_rows(values_by_title.get(title, [])))
         return rows
