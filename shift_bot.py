@@ -414,11 +414,17 @@ def build_who_text():
 def build_history_text(date_from, date_to, title):
     rows = fetch_sessions_for_period(date_from, date_to)
     period = fmt_period(date_from, date_to)
+    open_count = sum(1 for item in rows if not item.get("clock_out_time"))
+    closed_count = len(rows) - open_count
+    totals_text = (
+        f"⚠️ Открытые смены: {open_count}\n"
+        f"✅ Закрытые смены: {closed_count}"
+    )
 
     if not rows:
-        return f"{title}\n📅 {period}\n━━━━━━━━━━━━━━\nНет записей за этот период."
+        return f"{title}\n📅 {period}\n━━━━━━━━━━━━━━\n{totals_text}\n\nНет записей за этот период."
 
-    text = f"{title}\n📅 {period}\n━━━━━━━━━━━━━━\n"
+    text = f"{title}\n📅 {period}\n━━━━━━━━━━━━━━\n{totals_text}\n"
     for item in rows:
         emp = item.get("employees") or {}
         name = emp.get("full_name", "Без имени")
@@ -428,6 +434,8 @@ def build_history_text(date_from, date_to, title):
         duration = fmt_duration(item.get("duration_minutes"))
 
         text += f"\n• {name}\n   {clock_in} → {clock_out} · ⏱ {duration}"
+        if not item.get("clock_out_time"):
+            text += "\n   ⚠️ Уход не отмечен"
         if location:
             text += f"\n   📍 {location}"
         text += "\n"
