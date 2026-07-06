@@ -80,6 +80,13 @@ def fmt_duration(minutes):
     return f"{hours}ч {mins:02d}м"
 
 
+def fmt_clock_out_status(duration_minutes):
+    lines = ["⏱ смена закрыта"]
+    if duration_minutes is not None:
+        lines.append(f"⌛ Отработано: {fmt_duration(duration_minutes)}")
+    return "\n".join(lines)
+
+
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     response = requests.post(
@@ -271,7 +278,8 @@ def timemoto_webhook():
             f"🟢 Приход\n\n"
             f"👤 {full_name}\n"
             f"🏢 {department}\n"
-            f"🕒 {time_display}"
+            f"🕒 {time_display}\n"
+            f"⏱ смена открыта"
         )
     elif clock_type == "Out":
         send_telegram_message(
@@ -279,7 +287,7 @@ def timemoto_webhook():
             f"👤 {full_name}\n"
             f"🏢 {department}\n"
             f"🕒 {time_display}\n"
-            f"⏱ {fmt_duration(duration_minutes)}"
+            f"{fmt_clock_out_status(duration_minutes)}"
         )
 
     # Always 200 so TimeMoto does not retry-storm on transient DB issues.
