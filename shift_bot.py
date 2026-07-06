@@ -1,7 +1,9 @@
 import os
 import logging
 import calendar
+import asyncio
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -17,12 +19,17 @@ from telegram.ext import (
 )
 from supabase import create_client
 
+from sheets_sync import GoogleSheetsSync, month_bounds
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 # Prefer the service_role key (bypasses RLS); fall back to anon for local/dev.
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+DATA_SOURCE = os.getenv("DATA_SOURCE", "supabase").strip().lower()
+AUTO_CLOSE_HOURS = float(os.getenv("AUTO_CLOSE_HOURS", "8"))
+AUTO_CLOSE_MINUTES = int(AUTO_CLOSE_HOURS * 60)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -46,6 +53,7 @@ logger = logging.getLogger("shift_bot")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 flask_app = Flask(__name__)
+sheets_sync = GoogleSheetsSync(APP_TZ, logger)
 
 RU_MONTHS = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -257,10 +265,10 @@ def set_attendance_status(employee_id, on_shift, clock_in_iso, clock_out_iso, no
     ).execute()
 
 
-def fetch_on_shift():
+def fetch_on_shift_supabase():
     result = (
         supabase.table("attendance_status")
-        .select("clock_in_time, employees(full_name, position, location)")
+        .select("clock_in_time, employees(full_name, department, position, location)")
         .eq("on_shift", True)
         .order("clock_in_time")
         .execute()
@@ -268,12 +276,12 @@ def fetch_on_shift():
     return result.data or []
 
 
-def fetch_sessions(start_utc, end_utc):
+def fetch_sessions_supabase(start_utc, end_utc):
     result = (
         supabase.table("attendance_sessions")
         .select(
-            "clock_in_time, clock_out_time, duration_minutes, "
-            "employees(full_name, location)"
+            "id, clock_in_time, clock_out_time, duration_minutes, source, "
+            "employees(full_name, department, position, location)"
         )
         .gte("clock_in_time", start_utc)
         .lt("clock_in_time", end_utc)
@@ -283,10 +291,10 @@ def fetch_sessions(start_utc, end_utc):
     return result.data or []
 
 
-def fetch_clockins(start_utc, end_utc):
+def fetch_clockins_supabase(start_utc, end_utc):
     result = (
         supabase.table("attendance_sessions")
-        .select("clock_in_time, employees(full_name, location)")
+        .select("clock_in_time, employees(full_name, department, position, location)")
         .gte("clock_in_time", start_utc)
         .lt("clock_in_time", end_utc)
         .order("clock_in_time", desc=True)
@@ -295,16 +303,169 @@ def fetch_clockins(start_utc, end_utc):
     return result.data or []
 
 
-def fetch_clockouts(start_utc, end_utc):
+def fetch_clockouts_supabase(start_utc, end_utc):
     result = (
         supabase.table("attendance_sessions")
-        .select("clock_out_time, duration_minutes, employees(full_name)")
+        .select("clock_out_time, duration_minutes, employees(full_name, department, position)")
         .gte("clock_out_time", start_utc)
         .lt("clock_out_time", end_utc)
         .order("clock_out_time", desc=True)
         .execute()
     )
     return result.data or []
+
+
+def read_from_sheets():
+    return DATA_SOURCE == "sheets" and sheets_sync.is_ready()
+
+
+def fetch_on_shift():
+    if read_from_sheets():
+        try:
+            rows = sheets_sync.day_rows_for_bot(today_local())
+            return [row for row in rows if row.get("status") == "Открыта"]
+        except Exception:
+            logger.exception("Google Sheets read failed; falling back to Supabase")
+    return fetch_on_shift_supabase()
+
+
+def fetch_sessions_for_period(date_from, date_to):
+    if read_from_sheets():
+        try:
+            return sheets_sync.range_rows_for_bot(date_from, date_to)
+        except Exception:
+            logger.exception("Google Sheets history read failed; falling back to Supabase")
+
+    start_utc, end_utc = range_bounds_utc(date_from, date_to)
+    return fetch_sessions_supabase(start_utc, end_utc)
+
+
+def fetch_clockins(start_utc, end_utc):
+    if read_from_sheets():
+        try:
+            return [
+                row for row in sheets_sync.day_rows_for_bot(today_local())
+                if row.get("clock_in_time")
+            ]
+        except Exception:
+            logger.exception("Google Sheets clock-in read failed; falling back to Supabase")
+    return fetch_clockins_supabase(start_utc, end_utc)
+
+
+def fetch_clockouts(start_utc, end_utc):
+    if read_from_sheets():
+        try:
+            return [
+                row for row in sheets_sync.day_rows_for_bot(today_local())
+                if row.get("clock_out_time")
+            ]
+        except Exception:
+            logger.exception("Google Sheets clock-out read failed; falling back to Supabase")
+    return fetch_clockouts_supabase(start_utc, end_utc)
+
+
+def sync_day_to_sheets(selected_date):
+    if not sheets_sync.is_ready():
+        return None
+
+    start_utc, end_utc = day_bounds_utc(selected_date.isoformat())
+    rows = fetch_sessions_supabase(start_utc, end_utc)
+    return sheets_sync.sync_day(selected_date, rows)
+
+
+def sync_month_to_sheets(selected_date, sync_days=True):
+    if not sheets_sync.is_ready():
+        return None
+
+    first_day, last_day = month_bounds(selected_date)
+    if sync_days:
+        current = first_day
+        stop_at = min(last_day, today_local())
+        while current <= stop_at:
+            start_utc, end_utc = day_bounds_utc(current.isoformat())
+            rows = fetch_sessions_supabase(start_utc, end_utc)
+            if rows or current == today_local():
+                sheets_sync.sync_day(current, rows)
+            current += timedelta(days=1)
+
+    start_utc, end_utc = range_bounds_utc(first_day, last_day)
+    rows = fetch_sessions_supabase(start_utc, end_utc)
+    return sheets_sync.sync_month_summary(selected_date, rows)
+
+
+def auto_close_stale_sessions():
+    """Close sessions left open before today with a fixed 8-hour duration."""
+    today = today_local()
+    today_start_utc = day_bounds_utc(today.isoformat())[0]
+    result = (
+        supabase.table("attendance_sessions")
+        .select("id, employee_id, clock_in_time")
+        .is_("clock_out_time", "null")
+        .lt("clock_in_time", today_start_utc)
+        .execute()
+    )
+
+    rows = result.data or []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    changed_dates = set()
+
+    for row in rows:
+        clock_in_dt = parse_timestamp(row.get("clock_in_time"))
+        if not clock_in_dt:
+            continue
+
+        local_clock_in = clock_in_dt.astimezone(APP_TZ)
+        clock_out_dt = local_clock_in + timedelta(minutes=AUTO_CLOSE_MINUTES)
+        clock_out_iso = clock_out_dt.astimezone(timezone.utc).isoformat()
+
+        supabase.table("attendance_sessions").update(
+            {
+                "clock_out_time": clock_out_iso,
+                "duration_minutes": AUTO_CLOSE_MINUTES,
+                "source": "timemoto_auto_8h",
+            }
+        ).eq("id", row["id"]).execute()
+
+        set_attendance_status(
+            employee_id=row["employee_id"],
+            on_shift=False,
+            clock_in_iso=row.get("clock_in_time"),
+            clock_out_iso=clock_out_iso,
+            now_iso=now_iso,
+        )
+        changed_dates.add(local_clock_in.date())
+
+    for changed_date in sorted(changed_dates):
+        try:
+            sync_day_to_sheets(changed_date)
+        except Exception:
+            logger.exception("Google Sheets day sync failed after auto-close")
+
+    for changed_date in sorted({d.replace(day=1) for d in changed_dates}):
+        try:
+            sync_month_to_sheets(changed_date, sync_days=False)
+        except Exception:
+            logger.exception("Google Sheets month summary sync failed after auto-close")
+
+    if rows:
+        logger.info("Auto-closed %s stale attendance session(s)", len(rows))
+    return len(rows)
+
+
+def scheduler_loop():
+    last_daily_run = None
+    while True:
+        try:
+            now_local = datetime.now(APP_TZ)
+            if last_daily_run != now_local.date():
+                auto_close_stale_sessions()
+                sync_day_to_sheets(now_local.date())
+                if now_local.day == 1:
+                    sync_month_to_sheets(now_local.date() - timedelta(days=1), sync_days=False)
+                last_daily_run = now_local.date()
+        except Exception:
+            logger.exception("Background scheduler failed")
+        time.sleep(60)
 
 
 # --------------------------------------------------------------------------- #
@@ -414,13 +575,28 @@ def timemoto_webhook():
 
     # Persist to Supabase, but never let a DB error block the notification.
     duration_minutes = None
+    persisted = False
     try:
         duration_minutes = persist_attendance(
             user_id, full_name, employee_number, department, location,
             clock_type, clock_iso, clock_dt,
         )
+        persisted = True
     except Exception:
         logger.exception("Supabase write failed for TimeMoto webhook")
+
+    if persisted:
+        try:
+            local_event_date = clock_dt.astimezone(APP_TZ).date()
+            dates_to_sync = {local_event_date}
+            if clock_type == "Out":
+                dates_to_sync.add(local_event_date - timedelta(days=1))
+            for selected_date in sorted(dates_to_sync):
+                sync_day_to_sheets(selected_date)
+            for selected_month in sorted({d.replace(day=1) for d in dates_to_sync}):
+                sync_month_to_sheets(selected_month, sync_days=False)
+        except Exception:
+            logger.exception("Google Sheets sync failed for TimeMoto webhook")
 
     # Telegram notification is always sent.
     if clock_type == "In":
@@ -569,8 +745,7 @@ def build_who_text():
 
 
 def build_history_text(date_from, date_to, title):
-    start_utc, end_utc = range_bounds_utc(date_from, date_to)
-    rows = fetch_sessions(start_utc, end_utc)
+    rows = fetch_sessions_for_period(date_from, date_to)
     period = fmt_period(date_from, date_to)
 
     if not rows:
@@ -629,12 +804,16 @@ def build_clockouts_text():
 
 
 def build_settings_text():
+    report_source = "Google Sheets" if read_from_sheets() else "Supabase"
+    sheets_status = "включён" if sheets_sync.is_ready() else "выключен"
     return (
         "⚙️ Настройки\n"
         "━━━━━━━━━━━━━━\n"
         f"🕒 Часовой пояс: {APP_TZ}\n"
         f"💬 ID группы: {GROUP_ID}\n"
-        "🔗 Источник отметок: TimeMoto\n\n"
+        "🔗 Источник отметок: TimeMoto\n"
+        f"📊 Источник отчётов: {report_source}\n"
+        f"📄 Google Sheets: {sheets_status}\n\n"
         "Часовой пояс меняется переменной окружения TIMEZONE."
     )
 
@@ -692,6 +871,35 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📅 История\n━━━━━━━━━━━━━━\nВыберите период:",
         reply_markup=history_menu_kb(),
     )
+
+
+async def sync_sheets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    if not sheets_sync.is_ready():
+        await update.message.reply_text(
+            "Google Sheets не включён. Проверьте SHEETS_ENABLED, "
+            "GOOGLE_DRIVE_FOLDER_ID и Google service account в Railway Variables."
+        )
+        return
+
+    await update.message.reply_text("Начинаю синхронизацию текущего месяца в Google Sheets...")
+    try:
+        spreadsheet_id = await asyncio.to_thread(sync_month_to_sheets, today_local(), True)
+    except Exception:
+        logger.exception("Manual Google Sheets sync failed")
+        await update.message.reply_text("Не получилось синхронизировать Google Sheets. Проверьте логи Railway.")
+        return
+
+    if spreadsheet_id:
+        await update.message.reply_text(
+            "Готово: "
+            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+        )
+    else:
+        await update.message.reply_text("Синхронизация пропущена: Google Sheets не настроен.")
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -784,9 +992,11 @@ def main():
     app.add_handler(CommandHandler("shift", who_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("syncsheets", sync_sheets_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
 
     app.run_polling()
 
