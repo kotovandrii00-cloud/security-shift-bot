@@ -93,6 +93,12 @@ def overtime_minutes(duration_minutes):
     return max(0, int(duration_minutes) - PLAN_MINUTES)
 
 
+def fmt_overtime_label(minutes):
+    if minutes is None or int(minutes) <= 0:
+        return ""
+    return fmt_duration_label(minutes)
+
+
 def parse_duration_label(value):
     if value is None:
         return None
@@ -663,7 +669,7 @@ class GoogleSheetsSync:
             return row
 
         row[5] = fmt_duration_label(duration)
-        row[7] = fmt_duration_label(overtime_minutes(duration))
+        row[7] = fmt_overtime_label(overtime_minutes(duration))
         return row
 
     def _normalize_day_rows(self, selected_date, rows):
@@ -818,7 +824,7 @@ class GoogleSheetsSync:
             row[4] = close_label
             row[5] = fmt_duration_label(duration)
             row[6] = fmt_duration_label(PLAN_MINUTES)
-            row[7] = fmt_duration_label(overtime_minutes(duration))
+            row[7] = fmt_overtime_label(overtime_minutes(duration))
             changed_dates.add(selected_date)
             closed.append(
                 {
@@ -930,7 +936,7 @@ class GoogleSheetsSync:
                     row[4] = clock_out_dt.astimezone(self.app_tz).strftime("%H:%M")
                     row[5] = fmt_duration_label(auto_minutes)
                     row[6] = fmt_duration_label(PLAN_MINUTES)
-                    row[7] = fmt_duration_label(overtime_minutes(auto_minutes))
+                    row[7] = fmt_overtime_label(overtime_minutes(auto_minutes))
                     closed_count += 1
                     changed = True
 
@@ -1004,7 +1010,7 @@ class GoogleSheetsSync:
         duration_label = fmt_duration_label(duration) if clock_out else ""
         plan_label = fmt_duration_label(PLAN_MINUTES)
         overtime_label = (
-            fmt_duration_label(overtime_minutes(duration))
+            fmt_overtime_label(overtime_minutes(duration))
             if duration is not None and clock_out
             else ""
         )
@@ -1056,9 +1062,7 @@ class GoogleSheetsSync:
         title = "Итог месяца"
         sheet_id = self._ensure_sheet(spreadsheet_id, title)
 
-        totals = defaultdict(
-            lambda: {"shifts": 0, "minutes": 0, "plan_minutes": 0, "overtime_minutes": 0}
-        )
+        totals = defaultdict(lambda: {"shifts": 0, "minutes": 0, "plan_minutes": 0})
         for item in sessions:
             emp = item.get("employees") or {}
             department = emp.get("department") or emp.get("position") or "Без отдела"
@@ -1070,17 +1074,17 @@ class GoogleSheetsSync:
             totals[key]["shifts"] += 1
             totals[key]["minutes"] += int(duration)
             totals[key]["plan_minutes"] += PLAN_MINUTES
-            totals[key]["overtime_minutes"] += overtime_minutes(duration)
 
         rows = []
         for (department, employee), data in totals.items():
+            monthly_overtime = max(0, data["minutes"] - data["plan_minutes"])
             rows.append([
                 department,
                 employee,
                 data["shifts"],
                 fmt_duration_label(data["minutes"]),
                 fmt_duration_label(data["plan_minutes"]),
-                fmt_duration_label(data["overtime_minutes"]),
+                fmt_overtime_label(monthly_overtime),
             ])
         rows.sort(key=lambda row: (row[0].lower(), row[1].lower()))
 
