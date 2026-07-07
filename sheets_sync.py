@@ -17,14 +17,20 @@ DAY_HEADERS = [
     "Приход",
     "Уход",
     "Отработано",
+    "План",
+    "Переработка",
 ]
 
 SUMMARY_HEADERS = [
     "Отдел",
     "Сотрудник",
     "Смен",
-    "Отработано за месяц",
+    "Факт за месяц",
+    "План",
+    "Переработка",
 ]
+
+PLAN_MINUTES = 8 * 60
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -81,6 +87,12 @@ def fmt_duration_label(minutes):
     return f"{hours}ч {mins:02d}м"
 
 
+def overtime_minutes(duration_minutes):
+    if duration_minutes is None:
+        return None
+    return max(0, int(duration_minutes) - PLAN_MINUTES)
+
+
 def parse_duration_label(value):
     if value is None:
         return None
@@ -118,9 +130,11 @@ def parse_clock_minutes(value):
     text = str(value).strip()
     if not text or ":" not in text:
         return None
-    hours, _, minutes = text.partition(":")
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
     try:
-        return int(hours) * 60 + int(minutes)
+        return int(parts[0]) * 60 + int(parts[1])
     except ValueError:
         return None
 
@@ -302,7 +316,15 @@ class GoogleSheetsSync:
             body={"values": values},
         ).execute()
 
-    def _format_table(self, spreadsheet_id, sheet_id, row_count, col_count, open_row_indexes=None):
+    def _format_table(
+        self,
+        spreadsheet_id,
+        sheet_id,
+        row_count,
+        col_count,
+        open_row_indexes=None,
+        tab_color=None,
+    ):
         _, sheets = self._services()
         open_row_indexes = open_row_indexes or []
         reset_rows = max(row_count + 20, 200)
@@ -385,6 +407,19 @@ class GoogleSheetsSync:
             },
         ]
 
+        if tab_color is not None:
+            requests.append(
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "tabColor": tab_color,
+                        },
+                        "fields": "tabColor",
+                    }
+                }
+            )
+
         for row_index in open_row_indexes:
             requests.append(
                 {
@@ -440,7 +475,7 @@ class GoogleSheetsSync:
             return {}
 
         _, sheets = self._services()
-        ranges = [f"{worksheet_title_for_a1(title)}!A:F" for title in titles]
+        ranges = [f"{worksheet_title_for_a1(title)}!A:H" for title in titles]
         result = sheets.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
             ranges=ranges,
@@ -451,6 +486,23 @@ class GoogleSheetsSync:
             values_by_title[title] = value_range.get("values", [])
         return values_by_title
 
+    def _read_header_rows_batch(self, spreadsheet_id, titles):
+        if not titles:
+            return {}
+
+        _, sheets = self._services()
+        ranges = [f"{worksheet_title_for_a1(title)}!A1:H1" for title in titles]
+        result = sheets.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+        ).execute()
+
+        headers_by_title = {}
+        for title, value_range in zip(titles, result.get("valueRanges", [])):
+            values = value_range.get("values", [])
+            headers_by_title[title] = values[0] if values else []
+        return headers_by_title
+
     def _ensure_headers(self, spreadsheet_id, title, headers):
         sheet_id = self._ensure_sheet(spreadsheet_id, title)
         values = self._read_values(spreadsheet_id, title)
@@ -459,6 +511,11 @@ class GoogleSheetsSync:
         self._write_values(spreadsheet_id, title, [headers])
         self._format_table(spreadsheet_id, sheet_id, 1, len(headers))
         return sheet_id
+
+    def _tab_color_for_date(self, selected_date):
+        if selected_date and selected_date.weekday() >= 5:
+            return {"red": 0.74, "green": 0.74, "blue": 0.74}
+        return None
 
     def ensure_month_layout(self, selected_date):
         if not self.is_ready():
@@ -472,15 +529,15 @@ class GoogleSheetsSync:
         _, sheets = self._services()
         existing = self._sheet_ids_by_title(spreadsheet_id)
         first_day, last_day = month_bounds(selected_date)
-        desired = [("Итог месяца", SUMMARY_HEADERS)]
+        desired = [("Итог месяца", SUMMARY_HEADERS, None)]
         current = first_day
         while current <= last_day:
-            desired.append((day_sheet_name(current), DAY_HEADERS))
+            desired.append((day_sheet_name(current), DAY_HEADERS, current))
             current += timedelta(days=1)
 
         requests = []
         header_updates = []
-        summary_title, summary_headers = desired[0]
+        summary_title, summary_headers, _ = desired[0]
 
         if summary_title not in existing:
             if "Sheet1" in existing and len(existing) == 1:
@@ -497,13 +554,13 @@ class GoogleSheetsSync:
                 existing.pop("Sheet1", None)
             else:
                 requests.append({"addSheet": {"properties": {"title": summary_title}}})
-            header_updates.append((summary_title, summary_headers))
+            header_updates.append((summary_title, summary_headers, None, True))
 
-        for title, headers in desired[1:]:
+        for title, headers, tab_date in desired[1:]:
             if title in existing:
                 continue
             requests.append({"addSheet": {"properties": {"title": title}}})
-            header_updates.append((title, headers))
+            header_updates.append((title, headers, tab_date, True))
 
         if requests:
             sheets.spreadsheets().batchUpdate(
@@ -512,6 +569,20 @@ class GoogleSheetsSync:
             ).execute()
             self._meta_cache.pop(spreadsheet_id, None)
             existing = self._sheet_ids_by_title(spreadsheet_id)
+
+        pending_header_titles = {title for title, _, _, _ in header_updates}
+        existing_header_titles = [
+            title
+            for title, _, _ in desired
+            if title in existing and title not in pending_header_titles
+        ]
+        headers_by_title = self._read_header_rows_batch(spreadsheet_id, existing_header_titles)
+        for title, headers, tab_date in desired:
+            if title not in headers_by_title:
+                continue
+            current_headers = (headers_by_title[title] + [""] * len(headers))[:len(headers)]
+            if current_headers != headers:
+                header_updates.append((title, headers, tab_date, False))
 
         if header_updates:
             sheets.spreadsheets().values().batchUpdate(
@@ -523,17 +594,77 @@ class GoogleSheetsSync:
                             "range": f"{worksheet_title_for_a1(title)}!A1",
                             "values": [headers],
                         }
-                        for title, headers in header_updates
+                        for title, headers, _, _ in header_updates
                     ],
                 },
             ).execute()
-            for title, headers in header_updates:
+            for title, headers, tab_date, needs_format in header_updates:
+                if not needs_format:
+                    continue
                 sheet_id = existing.get(title)
                 if sheet_id is not None:
-                    self._format_table(spreadsheet_id, sheet_id, 1, len(headers))
+                    self._format_table(
+                        spreadsheet_id,
+                        sheet_id,
+                        1,
+                        len(headers),
+                        tab_color=self._tab_color_for_date(tab_date),
+                    )
+
+        tab_color_requests = []
+        for title, _, tab_date in desired[1:]:
+            tab_color = self._tab_color_for_date(tab_date)
+            sheet_id = existing.get(title)
+            if tab_color is None or sheet_id is None:
+                continue
+            tab_color_requests.append(
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "tabColor": tab_color,
+                        },
+                        "fields": "tabColor",
+                    }
+                }
+            )
+
+        if tab_color_requests:
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": tab_color_requests},
+            ).execute()
 
         self._layout_ready.add(cache_key)
         return spreadsheet_id
+
+    def _duration_from_day_row(self, row):
+        duration = parse_duration_label(row[5])
+        if duration is not None:
+            return duration
+
+        clock_in = parse_clock_minutes(row[3])
+        clock_out = parse_clock_minutes(row[4])
+        if clock_in is not None and clock_out is not None:
+            duration = clock_out - clock_in
+            if duration < 0:
+                duration += 24 * 60
+            return duration
+        return None
+
+    def _normalize_day_row_metrics(self, row):
+        if str(row[3]).strip() or str(row[4]).strip() or str(row[5]).strip():
+            row[6] = fmt_duration_label(PLAN_MINUTES)
+
+        duration = self._duration_from_day_row(row)
+        if duration is None or not str(row[4]).strip():
+            row[5] = ""
+            row[7] = ""
+            return row
+
+        row[5] = fmt_duration_label(duration)
+        row[7] = fmt_duration_label(overtime_minutes(duration))
+        return row
 
     def _normalize_day_rows(self, selected_date, rows):
         date_label = selected_date.strftime("%d.%m.%Y")
@@ -544,6 +675,7 @@ class GoogleSheetsSync:
                 continue
             if not padded[2]:
                 padded[2] = date_label
+            padded = self._normalize_day_row_metrics(padded)
             normalized.append(padded)
         normalized.sort(key=lambda row: (
             str(row[0]).lower(),
@@ -606,7 +738,14 @@ class GoogleSheetsSync:
         ]
 
         self._write_values(spreadsheet_id, title, values)
-        self._format_table(spreadsheet_id, sheet_id, len(values), len(DAY_HEADERS), open_rows)
+        self._format_table(
+            spreadsheet_id,
+            sheet_id,
+            len(values),
+            len(DAY_HEADERS),
+            open_rows,
+            tab_color=self._tab_color_for_date(selected_date),
+        )
         return spreadsheet_id
 
     def _row_clock_in_dt(self, row):
@@ -678,6 +817,8 @@ class GoogleSheetsSync:
             duration = max(0, int((close_local - clock_in_dt).total_seconds() // 60))
             row[4] = close_label
             row[5] = fmt_duration_label(duration)
+            row[6] = fmt_duration_label(PLAN_MINUTES)
+            row[7] = fmt_duration_label(overtime_minutes(duration))
             changed_dates.add(selected_date)
             closed.append(
                 {
@@ -711,6 +852,8 @@ class GoogleSheetsSync:
             selected_date.strftime("%d.%m.%Y"),
             local_dt.strftime("%H:%M"),
             "",
+            "",
+            fmt_duration_label(PLAN_MINUTES),
             "",
         ])
         self._write_day_rows(selected_date, rows)
@@ -786,6 +929,8 @@ class GoogleSheetsSync:
                     clock_out_dt = clock_in_dt + timedelta(minutes=auto_minutes)
                     row[4] = clock_out_dt.astimezone(self.app_tz).strftime("%H:%M")
                     row[5] = fmt_duration_label(auto_minutes)
+                    row[6] = fmt_duration_label(PLAN_MINUTES)
+                    row[7] = fmt_duration_label(overtime_minutes(auto_minutes))
                     closed_count += 1
                     changed = True
 
@@ -829,9 +974,11 @@ class GoogleSheetsSync:
                 padded = (row + [""] * len(DAY_HEADERS))[:len(DAY_HEADERS)]
                 if not any(str(cell).strip() for cell in padded):
                     continue
+                if not str(padded[4]).strip():
+                    continue
                 rows.append(
                     {
-                        "duration_minutes": parse_duration_label(padded[5]),
+                        "duration_minutes": self._duration_from_day_row(padded),
                         "employees": {
                             "full_name": padded[1],
                             "department": padded[0],
@@ -854,7 +1001,13 @@ class GoogleSheetsSync:
         clock_out = clock_out_dt.astimezone(self.app_tz).strftime("%H:%M") if clock_out_dt else ""
 
         duration = item.get("duration_minutes")
-        duration_label = fmt_duration_label(duration)
+        duration_label = fmt_duration_label(duration) if clock_out else ""
+        plan_label = fmt_duration_label(PLAN_MINUTES)
+        overtime_label = (
+            fmt_duration_label(overtime_minutes(duration))
+            if duration is not None and clock_out
+            else ""
+        )
 
         return [
             department,
@@ -863,6 +1016,8 @@ class GoogleSheetsSync:
             clock_in,
             clock_out,
             duration_label,
+            plan_label,
+            overtime_label,
         ]
 
     def sync_day(self, selected_date, sessions):
@@ -883,7 +1038,14 @@ class GoogleSheetsSync:
         ]
 
         self._write_values(spreadsheet_id, title, values)
-        self._format_table(spreadsheet_id, sheet_id, len(values), len(DAY_HEADERS), open_rows)
+        self._format_table(
+            spreadsheet_id,
+            sheet_id,
+            len(values),
+            len(DAY_HEADERS),
+            open_rows,
+            tab_color=self._tab_color_for_date(selected_date),
+        )
         return spreadsheet_id
 
     def sync_month_summary(self, selected_date, sessions):
@@ -894,7 +1056,9 @@ class GoogleSheetsSync:
         title = "Итог месяца"
         sheet_id = self._ensure_sheet(spreadsheet_id, title)
 
-        totals = defaultdict(lambda: {"shifts": 0, "minutes": 0})
+        totals = defaultdict(
+            lambda: {"shifts": 0, "minutes": 0, "plan_minutes": 0, "overtime_minutes": 0}
+        )
         for item in sessions:
             emp = item.get("employees") or {}
             department = emp.get("department") or emp.get("position") or "Без отдела"
@@ -905,6 +1069,8 @@ class GoogleSheetsSync:
             key = (department, employee)
             totals[key]["shifts"] += 1
             totals[key]["minutes"] += int(duration)
+            totals[key]["plan_minutes"] += PLAN_MINUTES
+            totals[key]["overtime_minutes"] += overtime_minutes(duration)
 
         rows = []
         for (department, employee), data in totals.items():
@@ -913,6 +1079,8 @@ class GoogleSheetsSync:
                 employee,
                 data["shifts"],
                 fmt_duration_label(data["minutes"]),
+                fmt_duration_label(data["plan_minutes"]),
+                fmt_duration_label(data["overtime_minutes"]),
             ])
         rows.sort(key=lambda row: (row[0].lower(), row[1].lower()))
 
@@ -926,7 +1094,7 @@ class GoogleSheetsSync:
         a1_title = worksheet_title_for_a1(title)
         result = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{a1_title}!A:F",
+            range=f"{a1_title}!A:H",
         ).execute()
         return result.get("values", [])
 
@@ -935,9 +1103,9 @@ class GoogleSheetsSync:
             return []
         rows = []
         for row in values[1:]:
-            padded = row + [""] * (len(DAY_HEADERS) - len(row))
-            duration_minutes = parse_duration_label(padded[5])
+            padded = (row + [""] * len(DAY_HEADERS))[:len(DAY_HEADERS)]
             clock_out = padded[4]
+            duration_minutes = self._duration_from_day_row(padded) if clock_out else None
 
             rows.append(
                 {
