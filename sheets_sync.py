@@ -522,7 +522,7 @@ class GoogleSheetsSync:
 
     def _tab_color_for_date(self, selected_date):
         if selected_date and selected_date.weekday() >= 5:
-            return {"red": 0.74, "green": 0.74, "blue": 0.74}
+            return {"red": 0.55, "green": 0.55, "blue": 0.55}
         return None
 
     def ensure_month_layout(self, selected_date):
