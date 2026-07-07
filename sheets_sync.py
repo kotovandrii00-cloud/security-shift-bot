@@ -379,6 +379,11 @@ class GoogleSheetsSync:
                     },
                     "cell": {
                         "userEnteredFormat": {
+                            "backgroundColor": {
+                                "red": 0.90,
+                                "green": 0.97,
+                                "blue": 0.92,
+                            },
                             "textFormat": {
                                 "bold": True,
                                 "underline": False,
@@ -387,19 +392,6 @@ class GoogleSheetsSync:
                         }
                     },
                     "fields": "userEnteredFormat(backgroundColor,textFormat)",
-                }
-            },
-            {
-                "setBasicFilter": {
-                    "filter": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 0,
-                            "endRowIndex": max(row_count, 1),
-                            "startColumnIndex": 0,
-                            "endColumnIndex": col_count,
-                        }
-                    }
                 }
             },
             {
@@ -463,6 +455,35 @@ class GoogleSheetsSync:
             body={"requests": requests},
         ).execute()
 
+        try:
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {"clearBasicFilter": {"sheetId": sheet_id}},
+                        {
+                            "setBasicFilter": {
+                                "filter": {
+                                    "range": {
+                                        "sheetId": sheet_id,
+                                        "startRowIndex": 0,
+                                        "endRowIndex": max(row_count, 1),
+                                        "startColumnIndex": 0,
+                                        "endColumnIndex": col_count,
+                                    }
+                                }
+                            }
+                        },
+                    ]
+                },
+            ).execute()
+        except Exception as exc:
+            self.logger.warning(
+                "Could not reset Google Sheets basic filter for sheet %s: %s",
+                sheet_id,
+                exc,
+            )
+
     def _sheet_id(self, spreadsheet_id, title):
         meta = self._spreadsheet_meta(spreadsheet_id)
         for item in meta.get("sheets", []):
@@ -522,7 +543,7 @@ class GoogleSheetsSync:
 
     def _tab_color_for_date(self, selected_date):
         if selected_date and selected_date.weekday() >= 5:
-            return {"red": 0.55, "green": 0.55, "blue": 0.55}
+            return {"red": 0.25, "green": 0.25, "blue": 0.25}
         return None
 
     def ensure_month_layout(self, selected_date):
