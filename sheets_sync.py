@@ -339,9 +339,12 @@ class GoogleSheetsSync:
                 "updateSheetProperties": {
                     "properties": {
                         "sheetId": sheet_id,
-                        "gridProperties": {"frozenRowCount": 1},
+                        "gridProperties": {
+                            "frozenRowCount": 1,
+                            "hideGridlines": False,
+                        },
                     },
-                    "fields": "gridProperties.frozenRowCount",
+                    "fields": "gridProperties.frozenRowCount,gridProperties.hideGridlines",
                 }
             },
             {
@@ -355,7 +358,6 @@ class GoogleSheetsSync:
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "backgroundColor": {"red": 1, "green": 1, "blue": 1},
                             "textFormat": {
                                 "bold": False,
                                 "underline": False,
@@ -377,7 +379,6 @@ class GoogleSheetsSync:
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "backgroundColor": {"red": 1, "green": 1, "blue": 1},
                             "textFormat": {
                                 "bold": True,
                                 "underline": False,
@@ -420,8 +421,9 @@ class GoogleSheetsSync:
                         "properties": {
                             "sheetId": sheet_id,
                             "tabColor": tab_color,
+                            "tabColorStyle": {"rgbColor": tab_color},
                         },
-                        "fields": "tabColor",
+                        "fields": "tabColor,tabColorStyle",
                     }
                 }
             )
@@ -617,28 +619,35 @@ class GoogleSheetsSync:
                         tab_color=self._tab_color_for_date(tab_date),
                     )
 
-        tab_color_requests = []
-        for title, _, tab_date in desired[1:]:
+        sheet_property_requests = []
+        for title, _, tab_date in desired:
             tab_color = self._tab_color_for_date(tab_date)
             sheet_id = existing.get(title)
-            if tab_color is None or sheet_id is None:
+            if sheet_id is None:
                 continue
-            tab_color_requests.append(
+            properties = {
+                "sheetId": sheet_id,
+                "gridProperties": {"hideGridlines": False},
+            }
+            fields = ["gridProperties.hideGridlines"]
+            if tab_color is not None:
+                properties["tabColor"] = tab_color
+                properties["tabColorStyle"] = {"rgbColor": tab_color}
+                fields.extend(["tabColor", "tabColorStyle"])
+
+            sheet_property_requests.append(
                 {
                     "updateSheetProperties": {
-                        "properties": {
-                            "sheetId": sheet_id,
-                            "tabColor": tab_color,
-                        },
-                        "fields": "tabColor",
+                        "properties": properties,
+                        "fields": ",".join(fields),
                     }
                 }
             )
 
-        if tab_color_requests:
+        if sheet_property_requests:
             sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
-                body={"requests": tab_color_requests},
+                body={"requests": sheet_property_requests},
             ).execute()
 
         self._layout_ready.add(cache_key)
