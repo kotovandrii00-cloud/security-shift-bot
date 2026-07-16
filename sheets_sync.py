@@ -62,6 +62,7 @@ COL_PLAN = 7
 COL_OVERTIME = 8
 
 PLAN_MINUTES = 8 * 60
+LUNCH_OPTIONS = ["1 ч", "2 часа", "3 часа", "4 часа"]
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
@@ -153,6 +154,14 @@ def parse_duration_label(value):
         return None
 
     normalized = text.replace(",", ".").lower()
+    compact = normalized.replace(" ", "")
+    for suffix in ("часов", "часа", "час"):
+        if compact.endswith(suffix):
+            try:
+                return int(float(compact[: -len(suffix)]) * 60)
+            except ValueError:
+                return None
+
     if normalized.endswith("м") and "ч" not in normalized:
         try:
             return int(float(normalized.replace("м", "").strip()))
@@ -389,6 +398,7 @@ class GoogleSheetsSync:
         col_count,
         open_row_indexes=None,
         tab_color=None,
+        lunch_dropdown=False,
     ):
         _, sheets = self._services()
         open_row_indexes = open_row_indexes or []
@@ -475,6 +485,35 @@ class GoogleSheetsSync:
                             "tabColorStyle": {"rgbColor": tab_color},
                         },
                         "fields": "tabColor,tabColorStyle",
+                    }
+                }
+            )
+
+        if lunch_dropdown:
+            requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": reset_rows,
+                            "startColumnIndex": COL_LUNCH,
+                            "endColumnIndex": COL_LUNCH + 1,
+                        },
+                        "cell": {
+                            "dataValidation": {
+                                "condition": {
+                                    "type": "ONE_OF_LIST",
+                                    "values": [
+                                        {"userEnteredValue": value}
+                                        for value in LUNCH_OPTIONS
+                                    ],
+                                },
+                                "strict": True,
+                                "showCustomUi": True,
+                            }
+                        },
+                        "fields": "dataValidation",
                     }
                 }
             )
@@ -619,11 +658,11 @@ class GoogleSheetsSync:
         first_day, last_day = month_bounds(selected_date)
         desired = [("Итог месяца", SUMMARY_HEADERS, None)]
         for week_start, week_end in month_week_ranges(selected_date):
+            current = week_start
+            while current <= week_end:
+                desired.append((day_sheet_name(current), DAY_HEADERS, current))
+                current += timedelta(days=1)
             desired.append((week_sheet_name(week_start, week_end), WEEKLY_HEADERS, None))
-        current = first_day
-        while current <= last_day:
-            desired.append((day_sheet_name(current), DAY_HEADERS, current))
-            current += timedelta(days=1)
 
         requests = []
         header_updates = []
@@ -726,19 +765,21 @@ class GoogleSheetsSync:
                         1,
                         len(headers),
                         tab_color=self._tab_color_for_date(tab_date),
+                        lunch_dropdown=tab_date is not None and headers == DAY_HEADERS,
                     )
 
         sheet_property_requests = []
-        for title, _, tab_date in desired:
+        for desired_index, (title, _, tab_date) in enumerate(desired):
             tab_color = self._tab_color_for_date(tab_date)
             sheet_id = existing.get(title)
             if sheet_id is None:
                 continue
             properties = {
                 "sheetId": sheet_id,
+                "index": desired_index,
                 "gridProperties": {"hideGridlines": False},
             }
-            fields = ["gridProperties.hideGridlines"]
+            fields = ["index", "gridProperties.hideGridlines"]
             if tab_color is not None:
                 properties["tabColor"] = tab_color
                 properties["tabColorStyle"] = {"rgbColor": tab_color}
@@ -752,12 +793,41 @@ class GoogleSheetsSync:
                     }
                 }
             )
+            if tab_date is not None:
+                sheet_property_requests.append(
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": 1000,
+                                "startColumnIndex": COL_LUNCH,
+                                "endColumnIndex": COL_LUNCH + 1,
+                            },
+                            "cell": {
+                                "dataValidation": {
+                                    "condition": {
+                                        "type": "ONE_OF_LIST",
+                                        "values": [
+                                            {"userEnteredValue": value}
+                                            for value in LUNCH_OPTIONS
+                                        ],
+                                    },
+                                    "strict": True,
+                                    "showCustomUi": True,
+                                }
+                            },
+                            "fields": "dataValidation",
+                        }
+                    }
+                )
 
         if sheet_property_requests:
             sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"requests": sheet_property_requests},
             ).execute()
+            self._meta_cache.pop(spreadsheet_id, None)
 
         self._layout_ready.add(cache_key)
         return spreadsheet_id
@@ -886,6 +956,7 @@ class GoogleSheetsSync:
             len(DAY_HEADERS),
             open_rows,
             tab_color=self._tab_color_for_date(selected_date),
+            lunch_dropdown=True,
         )
         return spreadsheet_id
 
