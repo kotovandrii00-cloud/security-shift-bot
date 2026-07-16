@@ -565,7 +565,9 @@ async def sync_sheets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("Обновляю вкладки и итог текущего месяца в Google Sheets...")
+    await update.message.reply_text(
+        "Обновляю дневные вкладки, недельные отчёты и итог месяца в Google Sheets..."
+    )
     try:
         spreadsheet_id = await asyncio.to_thread(sync_month_to_sheets, today_local(), True)
     except Exception:
