@@ -99,6 +99,20 @@ def sheets_write_error_text():
     )
 
 
+def google_error_payload(exc):
+    resp = getattr(exc, "resp", None)
+    content = getattr(exc, "content", b"")
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", errors="replace")
+    content = " ".join(str(content).split())
+    return {
+        "error_type": type(exc).__name__,
+        "error_status": getattr(resp, "status", None),
+        "error_reason": getattr(resp, "reason", None),
+        "error_message": content[:500] if content else str(exc)[:500],
+    }
+
+
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     response = requests.post(
@@ -247,7 +261,7 @@ def healthz():
         logger.exception("Deep health check failed")
         result["ok"] = False
         result["google_sheets_current_month"] = False
-        result["error_type"] = type(exc).__name__
+        result.update(google_error_payload(exc))
         return jsonify(result), 500
 
     return jsonify(result)
