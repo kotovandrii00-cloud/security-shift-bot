@@ -81,10 +81,22 @@ def fmt_duration(minutes):
 
 
 def fmt_clock_out_status(duration_minutes):
+    if duration_minutes is None:
+        return (
+            "⚠️ уход получен, но открытая смена в Google Sheets не найдена\n"
+            "Проверьте таблицу или логи Railway."
+        )
+
     lines = ["⏱ смена закрыта"]
-    if duration_minutes is not None:
-        lines.append(f"⌛ Отработано: {fmt_duration(duration_minutes)}")
+    lines.append(f"⌛ Отработано: {fmt_duration(duration_minutes)}")
     return "\n".join(lines)
+
+
+def sheets_write_error_text():
+    return (
+        "\n\n⚠️ Google Sheets: отметка не записалась. "
+        "Проверьте переменные Google и логи Railway."
+    )
 
 
 def send_telegram_message(text: str):
@@ -217,6 +229,30 @@ def home():
     return jsonify({"ok": True, "service": "staff-control-bot"})
 
 
+@flask_app.route("/healthz", methods=["GET"])
+def healthz():
+    result = {
+        "ok": True,
+        "service": "staff-control-bot",
+        "google_sheets_configured": sheets_sync.is_ready(),
+    }
+    if request.args.get("deep") != "1":
+        return jsonify(result)
+
+    try:
+        result["google_sheets_current_month"] = bool(
+            sheets_sync.ensure_month_layout(today_local())
+        )
+    except Exception as exc:
+        logger.exception("Deep health check failed")
+        result["ok"] = False
+        result["google_sheets_current_month"] = False
+        result["error_type"] = type(exc).__name__
+        return jsonify(result), 500
+
+    return jsonify(result)
+
+
 def persist_attendance(
     full_name, department, location, clock_type, clock_dt,
 ):
@@ -265,29 +301,41 @@ def timemoto_webhook():
 
     # Persist to Google Sheets, but never let a write error block notification.
     duration_minutes = None
+    sheets_write_failed = False
     try:
         duration_minutes = persist_attendance(
             full_name, department, location, clock_type, clock_dt,
         )
     except Exception:
+        sheets_write_failed = True
         logger.exception("Google Sheets write failed for TimeMoto webhook")
 
     # Telegram notification is always sent.
     if clock_type == "In":
-        send_telegram_message(
+        text = (
             f"🟢 Приход\n\n"
             f"👤 {full_name}\n"
             f"🏢 {department}\n"
             f"🕒 {time_display}\n"
             f"⏱ смена открыта"
         )
+        if sheets_write_failed:
+            text += sheets_write_error_text()
+        send_telegram_message(text)
     elif clock_type == "Out":
+        if sheets_write_failed:
+            status_text = (
+                "⚠️ уход получен, но в Google Sheets не записался\n"
+                "Проверьте переменные Google и логи Railway."
+            )
+        else:
+            status_text = fmt_clock_out_status(duration_minutes)
         send_telegram_message(
             f"🔴 Уход\n\n"
             f"👤 {full_name}\n"
             f"🏢 {department}\n"
             f"🕒 {time_display}\n"
-            f"{fmt_clock_out_status(duration_minutes)}"
+            f"{status_text}"
         )
 
     # Always 200 so TimeMoto does not retry-storm on transient DB issues.

@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -282,6 +283,25 @@ class GoogleSheetsSync:
         self._sheets = build("sheets", "v4", credentials=credentials, cache_discovery=False)
         return self._drive, self._sheets
 
+    def _execute(self, request, label="Google API request"):
+        delay = 1
+        for attempt in range(5):
+            try:
+                return request.execute()
+            except Exception as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status in (429, 500, 502, 503, 504) and attempt < 4:
+                    self.logger.warning(
+                        "%s failed with HTTP %s; retrying in %ss",
+                        label,
+                        status,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
+                    continue
+                raise
+
     def _find_spreadsheet(self, selected_date):
         drive, _ = self._services()
         title = month_file_name(selected_date)
@@ -299,7 +319,8 @@ class GoogleSheetsSync:
             spaces="drive",
             fields="files(id, name)",
             pageSize=10,
-        ).execute()
+        )
+        result = self._execute(result, "Find month spreadsheet")
 
         files = result.get("files", [])
         if files:
@@ -322,7 +343,8 @@ class GoogleSheetsSync:
                 "parents": [self.folder_id],
             },
             fields="id",
-        ).execute()
+        )
+        created = self._execute(created, "Create month spreadsheet")
         spreadsheet_id = created["id"]
         self._spreadsheet_id_cache[title] = spreadsheet_id
         self.logger.info("Created Google spreadsheet %s for %s", spreadsheet_id, title)
@@ -336,7 +358,8 @@ class GoogleSheetsSync:
         meta = sheets.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
             fields="sheets(properties(sheetId,title,index,gridProperties))",
-        ).execute()
+        )
+        meta = self._execute(meta, "Read spreadsheet metadata")
         self._meta_cache[spreadsheet_id] = meta
         return meta
 
@@ -352,7 +375,7 @@ class GoogleSheetsSync:
 
         if "Sheet1" in existing and len(existing) == 1:
             sheet_id = existing["Sheet1"]
-            sheets.spreadsheets().batchUpdate(
+            request = sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
                     "requests": [
@@ -364,31 +387,35 @@ class GoogleSheetsSync:
                         }
                     ]
                 },
-            ).execute()
+            )
+            self._execute(request, "Rename first sheet")
             self._meta_cache.pop(spreadsheet_id, None)
             return sheet_id
 
-        response = sheets.spreadsheets().batchUpdate(
+        request = sheets.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
-        ).execute()
+        )
+        response = self._execute(request, "Add sheet")
         self._meta_cache.pop(spreadsheet_id, None)
         return response["replies"][0]["addSheet"]["properties"]["sheetId"]
 
     def _write_values(self, spreadsheet_id, title, values):
         _, sheets = self._services()
         a1_title = worksheet_title_for_a1(title)
-        sheets.spreadsheets().values().clear(
+        request = sheets.spreadsheets().values().clear(
             spreadsheetId=spreadsheet_id,
             range=f"{a1_title}!A:Z",
             body={},
-        ).execute()
-        sheets.spreadsheets().values().update(
+        )
+        self._execute(request, "Clear sheet values")
+        request = sheets.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"{a1_title}!A1",
             valueInputOption="USER_ENTERED",
             body={"values": values},
-        ).execute()
+        )
+        self._execute(request, "Write sheet values")
 
     def _format_table(
         self,
@@ -548,13 +575,14 @@ class GoogleSheetsSync:
                 }
             )
 
-        sheets.spreadsheets().batchUpdate(
+        request = sheets.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
-        ).execute()
+        )
+        self._execute(request, "Format sheet")
 
         try:
-            sheets.spreadsheets().batchUpdate(
+            request = sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
                     "requests": [
@@ -574,7 +602,8 @@ class GoogleSheetsSync:
                         },
                     ]
                 },
-            ).execute()
+            )
+            self._execute(request, "Reset sheet filter")
         except Exception as exc:
             self.logger.warning(
                 "Could not reset Google Sheets basic filter for sheet %s: %s",
@@ -603,10 +632,11 @@ class GoogleSheetsSync:
 
         _, sheets = self._services()
         ranges = [f"{worksheet_title_for_a1(title)}!A:Z" for title in titles]
-        result = sheets.spreadsheets().values().batchGet(
+        request = sheets.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
             ranges=ranges,
-        ).execute()
+        )
+        result = self._execute(request, "Read sheet values batch")
 
         values_by_title = {}
         for title, value_range in zip(titles, result.get("valueRanges", [])):
@@ -619,10 +649,11 @@ class GoogleSheetsSync:
 
         _, sheets = self._services()
         ranges = [f"{worksheet_title_for_a1(title)}!A1:Z1" for title in titles]
-        result = sheets.spreadsheets().values().batchGet(
+        request = sheets.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
             ranges=ranges,
-        ).execute()
+        )
+        result = self._execute(request, "Read sheet headers batch")
 
         headers_by_title = {}
         for title, value_range in zip(titles, result.get("valueRanges", [])):
@@ -693,10 +724,11 @@ class GoogleSheetsSync:
             header_updates.append((title, headers, tab_date, True))
 
         if requests:
-            sheets.spreadsheets().batchUpdate(
+            request = sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"requests": requests},
-            ).execute()
+            )
+            self._execute(request, "Create month sheets")
             self._meta_cache.pop(spreadsheet_id, None)
             existing = self._sheet_ids_by_title(spreadsheet_id)
 
@@ -735,13 +767,14 @@ class GoogleSheetsSync:
                 header_updates.append((title, headers, tab_date, False))
 
         if structure_updates:
-            sheets.spreadsheets().batchUpdate(
+            request = sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"requests": structure_updates},
-            ).execute()
+            )
+            self._execute(request, "Migrate day sheet columns")
 
         if header_updates:
-            sheets.spreadsheets().values().batchUpdate(
+            request = sheets.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
                     "valueInputOption": "USER_ENTERED",
@@ -753,23 +786,11 @@ class GoogleSheetsSync:
                         for title, headers, _, _ in header_updates
                     ],
                 },
-            ).execute()
-            for title, headers, tab_date, needs_format in header_updates:
-                if not needs_format:
-                    continue
-                sheet_id = existing.get(title)
-                if sheet_id is not None:
-                    self._format_table(
-                        spreadsheet_id,
-                        sheet_id,
-                        1,
-                        len(headers),
-                        tab_color=self._tab_color_for_date(tab_date),
-                        lunch_dropdown=tab_date is not None and headers == DAY_HEADERS,
-                    )
+            )
+            self._execute(request, "Write sheet headers")
 
         sheet_property_requests = []
-        for desired_index, (title, _, tab_date) in enumerate(desired):
+        for desired_index, (title, headers, tab_date) in enumerate(desired):
             tab_color = self._tab_color_for_date(tab_date)
             sheet_id = existing.get(title)
             if sheet_id is None:
@@ -790,6 +811,34 @@ class GoogleSheetsSync:
                     "updateSheetProperties": {
                         "properties": properties,
                         "fields": ",".join(fields),
+                    }
+                }
+            )
+            sheet_property_requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(headers),
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {
+                                    "red": 0.90,
+                                    "green": 0.97,
+                                    "blue": 0.92,
+                                },
+                                "textFormat": {
+                                    "bold": True,
+                                    "underline": False,
+                                    "foregroundColor": {"red": 0, "green": 0, "blue": 0},
+                                },
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)",
                     }
                 }
             )
@@ -823,10 +872,11 @@ class GoogleSheetsSync:
                 )
 
         if sheet_property_requests:
-            sheets.spreadsheets().batchUpdate(
+            request = sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"requests": sheet_property_requests},
-            ).execute()
+            )
+            self._execute(request, "Update month sheet properties")
             self._meta_cache.pop(spreadsheet_id, None)
 
         self._layout_ready.add(cache_key)
@@ -1067,7 +1117,7 @@ class GoogleSheetsSync:
         full_name = full_name or "Без имени"
         department = department or "Без отдела"
 
-        closed = self._close_employee_open_rows(full_name, local_dt)
+        self._close_employee_open_rows(full_name, local_dt)
         _, _, rows = self._read_day_rows(selected_date, create=True)
         rows.append([
             department,
@@ -1081,11 +1131,6 @@ class GoogleSheetsSync:
             "",
         ])
         self._write_day_rows(selected_date, rows)
-
-        changed_months = {selected_date.replace(day=1)}
-        changed_months.update(item["date"].replace(day=1) for item in closed)
-        for month_date in sorted(changed_months):
-            self.sync_month_summary_from_sheets(month_date)
         return None
 
     def record_clock_out(self, clock_dt, full_name, department="", location=""):
@@ -1094,9 +1139,6 @@ class GoogleSheetsSync:
 
         full_name = full_name or "Без имени"
         closed = self._close_employee_open_rows(full_name, clock_dt, close_all=False)
-        changed_months = {item["date"].replace(day=1) for item in closed}
-        for month_date in sorted(changed_months):
-            self.sync_month_summary_from_sheets(month_date)
 
         if not closed:
             self.logger.warning("No open Google Sheets shift found for %s", full_name)
@@ -1345,10 +1387,11 @@ class GoogleSheetsSync:
     def _read_values(self, spreadsheet_id, title):
         _, sheets = self._services()
         a1_title = worksheet_title_for_a1(title)
-        result = sheets.spreadsheets().values().get(
+        request = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=f"{a1_title}!A:Z",
-        ).execute()
+        )
+        result = self._execute(request, "Read sheet values")
         return result.get("values", [])
 
     def _values_to_bot_rows(self, values):
