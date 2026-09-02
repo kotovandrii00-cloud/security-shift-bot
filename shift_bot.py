@@ -157,6 +157,29 @@ def today_local():
     return datetime.now(APP_TZ).date()
 
 
+def parse_health_date():
+    raw_date = request.args.get("date")
+    today = today_local()
+    if not raw_date:
+        return today, None
+
+    try:
+        selected_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None, ("date must be YYYY-MM-DD", 400)
+
+    first_current = today.replace(day=1)
+    first_previous = (first_current - timedelta(days=1)).replace(day=1)
+    allowed_months = {
+        first_current.strftime("%Y-%m"),
+        first_previous.strftime("%Y-%m"),
+    }
+    if selected_date.strftime("%Y-%m") not in allowed_months:
+        return None, ("date must be in current or previous month", 400)
+
+    return selected_date, None
+
+
 def fmt_period(date_from, date_to):
     if date_from == date_to:
         return date_from.strftime("%d.%m.%Y")
@@ -267,9 +290,18 @@ def healthz():
     if request.args.get("deep") != "1":
         return jsonify(result)
 
+    selected_date, date_error = parse_health_date()
+    if date_error:
+        message, status_code = date_error
+        result["ok"] = False
+        result["error_message"] = message
+        return jsonify(result), status_code
+
+    result["checked_date"] = selected_date.isoformat()
+
     try:
         result["google_sheets_current_month"] = bool(
-            sheets_sync.ensure_month_layout(today_local())
+            sheets_sync.ensure_month_layout(selected_date)
         )
     except Exception as exc:
         logger.exception("Google Sheets deep health check failed")
