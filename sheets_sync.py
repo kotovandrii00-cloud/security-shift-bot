@@ -78,6 +78,16 @@ def env_bool(name, default=False):
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_int(name, default=0):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def parse_timestamp(value, app_tz):
     if not value:
         return None
@@ -258,6 +268,7 @@ class GoogleSheetsSync:
         self._sheets = None
         self._layout_ready = set()
         self._spreadsheet_id_cache = {}
+        self.spreadsheet_cache_seconds = env_int("GOOGLE_SPREADSHEET_CACHE_SECONDS", 60)
         self._meta_cache = {}
 
     def is_ready(self):
@@ -305,8 +316,14 @@ class GoogleSheetsSync:
     def _find_spreadsheet(self, selected_date):
         drive, _ = self._services()
         title = month_file_name(selected_date)
-        if title in self._spreadsheet_id_cache:
-            return self._spreadsheet_id_cache[title]
+        cached = self._spreadsheet_id_cache.get(title)
+        if cached:
+            spreadsheet_id, cached_at = cached
+            if self.spreadsheet_cache_seconds < 0:
+                return spreadsheet_id
+            if time.time() - cached_at <= self.spreadsheet_cache_seconds:
+                return spreadsheet_id
+            self._spreadsheet_id_cache.pop(title, None)
 
         escaped_title = title.replace("\\", "\\\\").replace("'", "\\'")
         query = (
@@ -325,7 +342,7 @@ class GoogleSheetsSync:
         files = result.get("files", [])
         if files:
             spreadsheet_id = files[0]["id"]
-            self._spreadsheet_id_cache[title] = spreadsheet_id
+            self._spreadsheet_id_cache[title] = (spreadsheet_id, time.time())
             return spreadsheet_id
         return None
 
@@ -346,7 +363,7 @@ class GoogleSheetsSync:
         )
         created = self._execute(created, "Create month spreadsheet")
         spreadsheet_id = created["id"]
-        self._spreadsheet_id_cache[title] = spreadsheet_id
+        self._spreadsheet_id_cache[title] = (spreadsheet_id, time.time())
         self.logger.info("Created Google spreadsheet %s for %s", spreadsheet_id, title)
         return spreadsheet_id
 
@@ -680,7 +697,7 @@ class GoogleSheetsSync:
             return None
 
         spreadsheet_id = self._find_or_create_spreadsheet(selected_date)
-        cache_key = month_file_name(selected_date)
+        cache_key = (month_file_name(selected_date), spreadsheet_id)
         if cache_key in self._layout_ready:
             return spreadsheet_id
 
