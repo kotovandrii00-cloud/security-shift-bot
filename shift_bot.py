@@ -113,6 +113,20 @@ def google_error_payload(exc):
     }
 
 
+def telegram_health_payload():
+    response = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/getMe",
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    user = payload.get("result") or {}
+    return {
+        "telegram_ok": bool(payload.get("ok")),
+        "telegram_username": user.get("username"),
+    }
+
+
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     response = requests.post(
@@ -258,10 +272,21 @@ def healthz():
             sheets_sync.ensure_month_layout(today_local())
         )
     except Exception as exc:
-        logger.exception("Deep health check failed")
+        logger.exception("Google Sheets deep health check failed")
         result["ok"] = False
         result["google_sheets_current_month"] = False
         result.update(google_error_payload(exc))
+
+    try:
+        result.update(telegram_health_payload())
+    except Exception as exc:
+        logger.exception("Telegram deep health check failed")
+        result["ok"] = False
+        result["telegram_ok"] = False
+        result["telegram_error_type"] = type(exc).__name__
+        result["telegram_error_message"] = str(exc)[:500]
+
+    if not result["ok"]:
         return jsonify(result), 500
 
     return jsonify(result)
