@@ -1053,6 +1053,49 @@ class GoogleSheetsSync:
             tzinfo=self.app_tz,
         )
 
+    def _row_clock_out_dt(self, row):
+        row_date = parse_date_label(row[COL_DATE])
+        clock_in = parse_clock_minutes(row[COL_CLOCK_IN])
+        clock_out = parse_clock_minutes(row[COL_CLOCK_OUT])
+        if row_date is None or clock_in is None or clock_out is None:
+            return None
+        if clock_out < clock_in:
+            row_date += timedelta(days=1)
+        return datetime(
+            row_date.year,
+            row_date.month,
+            row_date.day,
+            clock_out // 60,
+            clock_out % 60,
+            tzinfo=self.app_tz,
+        )
+
+    def _has_clock_in(self, rows, employee, clock_dt):
+        local_dt = clock_dt.astimezone(self.app_tz)
+        expected_time = local_dt.hour * 60 + local_dt.minute
+        expected_date = local_dt.date()
+        for row in rows:
+            if normalize_name(row[COL_EMPLOYEE]) != normalize_name(employee):
+                continue
+            if parse_date_label(row[COL_DATE]) != expected_date:
+                continue
+            if parse_clock_minutes(row[COL_CLOCK_IN]) == expected_time:
+                return True
+        return False
+
+    def _matching_closed_shift(self, employee, close_dt, days_back=2):
+        close_local = close_dt.astimezone(self.app_tz).replace(second=0, microsecond=0)
+        for offset in range(days_back):
+            selected_date = close_local.date() - timedelta(days=offset)
+            _, _, rows = self._read_day_rows(selected_date, create=False)
+            for row in rows:
+                if normalize_name(row[COL_EMPLOYEE]) != normalize_name(employee):
+                    continue
+                row_close_dt = self._row_clock_out_dt(row)
+                if row_close_dt == close_local:
+                    return True, self._duration_from_day_row(row)
+        return False, None
+
     def _recent_dates(self, end_date, days=31):
         for offset in range(days):
             yield end_date - timedelta(days=offset)
@@ -1134,6 +1177,15 @@ class GoogleSheetsSync:
         full_name = full_name or "Без имени"
         department = department or "Без отдела"
 
+        _, _, existing_rows = self._read_day_rows(selected_date, create=True)
+        if self._has_clock_in(existing_rows, full_name, local_dt):
+            self.logger.info(
+                "Duplicate Google Sheets clock-in ignored for %s at %s",
+                full_name,
+                local_dt.isoformat(),
+            )
+            return None
+
         self._close_employee_open_rows(full_name, local_dt)
         _, _, rows = self._read_day_rows(selected_date, create=True)
         rows.append([
@@ -1158,6 +1210,14 @@ class GoogleSheetsSync:
         closed = self._close_employee_open_rows(full_name, clock_dt, close_all=False)
 
         if not closed:
+            duplicate, duration = self._matching_closed_shift(full_name, clock_dt)
+            if duplicate:
+                self.logger.info(
+                    "Duplicate Google Sheets clock-out ignored for %s at %s",
+                    full_name,
+                    clock_dt.isoformat(),
+                )
+                return duration
             self.logger.warning("No open Google Sheets shift found for %s", full_name)
             return None
         return closed[-1]["duration_minutes"]
