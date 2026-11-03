@@ -2,6 +2,7 @@ import os
 import logging
 import calendar
 import asyncio
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta
@@ -230,6 +231,13 @@ def fetch_available_months():
     return sheets_sync.available_months_for_bot(today_local())
 
 
+def fetch_all_history_rows(months=None):
+    months = months if months is not None else fetch_available_months()
+    if not months:
+        return []
+    return fetch_sessions_for_period(months[0], today_local())
+
+
 def fetch_clockins(selected_date):
     return [
         row for row in sheets_sync.day_rows_for_bot(selected_date)
@@ -423,6 +431,7 @@ def main_menu_kb():
                 InlineKeyboardButton("📊 Отчёт", callback_data="report"),
             ],
             [InlineKeyboardButton("🗂 Все месяцы", callback_data="hist:all")],
+            [InlineKeyboardButton("👤 История сотрудника", callback_data="employees")],
             [
                 InlineKeyboardButton("🟢 Приходы", callback_data="clockins"),
                 InlineKeyboardButton("🔴 Уходы", callback_data="clockouts"),
@@ -452,6 +461,7 @@ def history_menu_kb():
                 InlineKeyboardButton("🗂 Вся история", callback_data="hist:all"),
             ],
             [InlineKeyboardButton("📅 Выбрать дату", callback_data="hist:pick")],
+            [InlineKeyboardButton("👤 Выбрать сотрудника", callback_data="employees")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
         ]
     )
@@ -485,6 +495,65 @@ def month_result_kb(selected_date):
                 InlineKeyboardButton("⬅️ Все месяцы", callback_data="hist:all"),
                 InlineKeyboardButton("🏠 Меню", callback_data="menu"),
             ],
+        ]
+    )
+
+
+def employee_token(department, name):
+    value = f"{department}\0{name}".encode("utf-8")
+    return hashlib.sha1(value).hexdigest()[:12]
+
+
+def employee_options(rows):
+    options = {}
+    for item in rows:
+        employee = item.get("employees") or {}
+        name = employee.get("full_name") or "Без имени"
+        department = employee.get("department") or "Без отдела"
+        token = employee_token(department, name)
+        options[token] = {"name": name, "department": department}
+    return dict(
+        sorted(
+            options.items(),
+            key=lambda pair: (pair[1]["department"], pair[1]["name"]),
+        )
+    )
+
+
+def employee_list_kb(options):
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{item['name']} · {item['department']}",
+                callback_data=f"employee:{token}",
+            )
+        ]
+        for token, item in options.items()
+    ]
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="history")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def employee_history_kb(token, months):
+    keyboard = []
+    buttons = [
+        InlineKeyboardButton(
+            f"{RU_MONTHS[item.month - 1]} {item.year}",
+            callback_data=f"empmonth:{item.year}:{item.month}:{token}",
+        )
+        for item in reversed(months)
+    ]
+    for index in range(0, len(buttons), 2):
+        keyboard.append(buttons[index:index + 2])
+    keyboard.append([InlineKeyboardButton("⬅️ Сотрудники", callback_data="employees")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def employee_month_kb(token):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⬅️ Все месяцы сотрудника", callback_data=f"employee:{token}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
         ]
     )
 
@@ -687,6 +756,110 @@ def build_all_history_text(months):
     )
 
 
+def employee_rows(rows, name, department):
+    selected = []
+    for item in rows:
+        employee = item.get("employees") or {}
+        if employee.get("full_name") != name:
+            continue
+        if (employee.get("department") or "Без отдела") != department:
+            continue
+        selected.append(item)
+    return selected
+
+
+def build_employee_summary_text(name, department, rows):
+    selected = employee_rows(rows, name, department)
+    open_count = sum(1 for item in selected if not item.get("clock_out_time"))
+    closed_count = len(selected) - open_count
+    total_minutes = sum(
+        int(item.get("duration_minutes") or 0)
+        for item in selected
+        if item.get("clock_out_time")
+    )
+
+    text = (
+        f"👤 {name}\n"
+        f"🏢 {department}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🗓 Всего смен: {len(selected)}\n"
+        f"⚠️ Открытые: {open_count}\n"
+        f"✅ Закрытые: {closed_count}\n"
+        f"⌛ Фактически отработано: {fmt_total_minutes(total_minutes)}"
+    )
+    if not selected:
+        return text + "\n\nИстория сотрудника не найдена.", []
+
+    month_data = {}
+    for item in selected:
+        row_date = parse_sheet_date(item.get("date") or item.get("date_label"))
+        if row_date is None:
+            continue
+        month_date = row_date.replace(day=1)
+        data = month_data.setdefault(
+            month_date,
+            {"shifts": 0, "open": 0, "minutes": 0},
+        )
+        data["shifts"] += 1
+        if item.get("clock_out_time"):
+            data["minutes"] += int(item.get("duration_minutes") or 0)
+        else:
+            data["open"] += 1
+
+    text += "\n\nПо месяцам:"
+    for month_date in sorted(month_data):
+        data = month_data[month_date]
+        text += (
+            f"\n• {RU_MONTHS[month_date.month - 1]} {month_date.year} — "
+            f"{data['shifts']} смен · {fmt_total_minutes(data['minutes'])}"
+        )
+        if data["open"]:
+            text += f" · ⚠️ {data['open']}"
+    return text, sorted(month_data)
+
+
+def build_employee_month_text(name, department, selected_date, rows):
+    first, last = month_bounds(selected_date)
+    last = min(last, today_local())
+    selected = []
+    for item in employee_rows(rows, name, department):
+        row_date = parse_sheet_date(item.get("date") or item.get("date_label"))
+        if row_date is not None and first <= row_date <= last:
+            selected.append((row_date, item))
+    selected.sort(key=lambda pair: (pair[0], str(pair[1].get("clock_in_time") or "")))
+
+    open_count = sum(1 for _, item in selected if not item.get("clock_out_time"))
+    closed_count = len(selected) - open_count
+    total_minutes = sum(
+        int(item.get("duration_minutes") or 0)
+        for _, item in selected
+        if item.get("clock_out_time")
+    )
+    text = (
+        f"👤 {name}\n"
+        f"🏢 {department}\n"
+        f"📅 {RU_MONTHS[selected_date.month - 1]} {selected_date.year}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"⚠️ Открытые: {open_count}\n"
+        f"✅ Закрытые: {closed_count}\n"
+        f"⌛ Факт: {fmt_total_minutes(total_minutes)}"
+    )
+    if not selected:
+        return text + "\n\nВ этом месяце смен нет."
+
+    for row_date, item in selected:
+        clock_in = fmt_time(item.get("clock_in_time"))
+        clock_out = fmt_time(item.get("clock_out_time"))
+        duration = fmt_duration(item.get("duration_minutes"))
+        text += (
+            f"\n\n• {row_date.strftime('%d.%m.%Y')}\n"
+            f"   {clock_in} → {clock_out} · ⏱ {duration}"
+        )
+        if not item.get("clock_out_time"):
+            text += "\n   ⚠️ Уход не отмечен"
+    return text
+
+
 def build_clockins_text():
     rows = fetch_clockins(today_local())
 
@@ -869,6 +1042,67 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             "📅 История\n━━━━━━━━━━━━━━\nВыберите период:",
             history_menu_kb(),
+        )
+        return
+
+    if data == "employees":
+        months = fetch_available_months()
+        rows = fetch_all_history_rows(months)
+        options = employee_options(rows)
+        text = (
+            "👤 История сотрудника\n"
+            "━━━━━━━━━━━━━━\n"
+            f"Сотрудников в архиве: {len(options)}\n\n"
+            "Выберите сотрудника:"
+        )
+        if not options:
+            text += "\nИстория посещений пока пуста."
+        await render(update, text, employee_list_kb(options))
+        return
+
+    if data.startswith("employee:"):
+        token = data.split(":", 1)[1]
+        months = fetch_available_months()
+        rows = fetch_all_history_rows(months)
+        option = employee_options(rows).get(token)
+        if option is None:
+            await render(
+                update,
+                "Сотрудник не найден. Обновите список.",
+                back_kb("employees"),
+            )
+            return
+        text, employee_months = build_employee_summary_text(
+            option["name"],
+            option["department"],
+            rows,
+        )
+        await render(update, text, employee_history_kb(token, employee_months))
+        return
+
+    if data.startswith("empmonth:"):
+        _, year, month, token = data.split(":")
+        selected_date = datetime(int(year), int(month), 1).date()
+        first, last = month_bounds(selected_date)
+        last = min(last, today_local())
+        rows = fetch_sessions_for_period(first, last)
+        option = employee_options(rows).get(token)
+        if option is None:
+            await render(
+                update,
+                "История сотрудника за этот месяц не найдена.",
+                employee_month_kb(token),
+            )
+            return
+        await render(
+            update,
+            build_employee_month_text(
+                option["name"],
+                option["department"],
+                selected_date,
+                rows,
+            ),
+            employee_month_kb(token),
         )
         return
 
