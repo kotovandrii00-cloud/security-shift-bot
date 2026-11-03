@@ -18,7 +18,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from sheets_sync import GoogleSheetsSync
+from sheets_sync import GoogleSheetsSync, month_bounds
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -224,6 +224,10 @@ def fetch_on_shift():
 
 def fetch_sessions_for_period(date_from, date_to):
     return sheets_sync.range_rows_for_bot(date_from, date_to)
+
+
+def fetch_available_months():
+    return sheets_sync.available_months_for_bot(today_local())
 
 
 def fetch_clockins(selected_date):
@@ -442,9 +446,44 @@ def history_menu_kb():
                 InlineKeyboardButton("📅 Вчера", callback_data="hist:yesterday"),
             ],
             [InlineKeyboardButton("📅 Последние 7 дней", callback_data="hist:7d")],
-            [InlineKeyboardButton("📅 Этот месяц", callback_data="hist:month")],
+            [
+                InlineKeyboardButton("📅 Этот месяц", callback_data="hist:month"),
+                InlineKeyboardButton("🗂 Вся история", callback_data="hist:all"),
+            ],
             [InlineKeyboardButton("📅 Выбрать дату", callback_data="hist:pick")],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+        ]
+    )
+
+
+def history_months_kb(months):
+    keyboard = []
+    buttons = [
+        InlineKeyboardButton(
+            f"{RU_MONTHS[item.month - 1]} {item.year}",
+            callback_data=f"histmonth:{item.year}:{item.month}",
+        )
+        for item in reversed(months)
+    ]
+    for index in range(0, len(buttons), 2):
+        keyboard.append(buttons[index:index + 2])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="history")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def month_result_kb(selected_date):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📅 Выбрать день",
+                    callback_data=f"cal:{selected_date.year}:{selected_date.month}",
+                )
+            ],
+            [
+                InlineKeyboardButton("⬅️ Все месяцы", callback_data="hist:all"),
+                InlineKeyboardButton("🏠 Меню", callback_data="menu"),
+            ],
         ]
     )
 
@@ -562,6 +601,91 @@ def build_history_text(date_from, date_to, title):
     return text.rstrip()
 
 
+def fmt_total_minutes(minutes):
+    minutes = max(0, int(minutes or 0))
+    return f"{minutes // 60}ч {minutes % 60:02d}м"
+
+
+def build_period_summary_text(date_from, date_to, title):
+    rows = fetch_sessions_for_period(date_from, date_to)
+    open_count = sum(1 for item in rows if not item.get("clock_out_time"))
+    closed_count = len(rows) - open_count
+    total_minutes = sum(
+        int(item.get("duration_minutes") or 0)
+        for item in rows
+        if item.get("clock_out_time")
+    )
+
+    text = (
+        f"{title}\n"
+        f"📅 {fmt_period(date_from, date_to)}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"⚠️ Открытые смены: {open_count}\n"
+        f"✅ Закрытые смены: {closed_count}\n"
+        f"⌛ Фактически отработано: {fmt_total_minutes(total_minutes)}"
+    )
+    if not rows:
+        return text + "\n\nНет записей за этот период."
+
+    employees = {}
+    for item in rows:
+        employee = item.get("employees") or {}
+        name = employee.get("full_name") or "Без имени"
+        data = employees.setdefault(name, {"shifts": 0, "open": 0, "minutes": 0})
+        data["shifts"] += 1
+        if item.get("clock_out_time"):
+            data["minutes"] += int(item.get("duration_minutes") or 0)
+        else:
+            data["open"] += 1
+
+    text += "\n\nПо сотрудникам:"
+    for name in sorted(employees):
+        data = employees[name]
+        text += (
+            f"\n• {name} — {data['shifts']} смен · "
+            f"{fmt_total_minutes(data['minutes'])}"
+        )
+        if data["open"]:
+            text += f" · ⚠️ открыто: {data['open']}"
+    return text
+
+
+def build_month_summary_text(selected_date):
+    first, last = month_bounds(selected_date)
+    last = min(last, today_local())
+    return build_period_summary_text(
+        first,
+        last,
+        f"📊 {RU_MONTHS[selected_date.month - 1]} {selected_date.year}",
+    )
+
+
+def build_all_history_text(months):
+    if not months:
+        return "🗂 Вся история\n━━━━━━━━━━━━━━\nСохранённые месяцы не найдены."
+
+    date_from = months[0]
+    date_to = today_local()
+    rows = fetch_sessions_for_period(date_from, date_to)
+    open_count = sum(1 for item in rows if not item.get("clock_out_time"))
+    closed_count = len(rows) - open_count
+    total_minutes = sum(
+        int(item.get("duration_minutes") or 0)
+        for item in rows
+        if item.get("clock_out_time")
+    )
+    return (
+        "🗂 Вся история посещений\n"
+        f"📅 {fmt_period(date_from, date_to)}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📁 Месяцев: {len(months)}\n"
+        f"⚠️ Открытые смены: {open_count}\n"
+        f"✅ Закрытые смены: {closed_count}\n"
+        f"⌛ Фактически отработано: {fmt_total_minutes(total_minutes)}\n\n"
+        "Выберите месяц, затем при необходимости конкретный рабочий день."
+    )
+
+
 def build_clockins_text():
     rows = fetch_clockins(today_local())
 
@@ -649,9 +773,10 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа.")
         return
-    d = today_local()
+    selected_date = today_local()
     await update.message.reply_text(
-        build_history_text(d, d, "📊 Отчёт за сегодня"), reply_markup=back_kb()
+        build_month_summary_text(selected_date),
+        reply_markup=month_result_kb(selected_date),
     )
 
 
@@ -718,8 +843,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "report":
-        d = today_local()
-        await render(update, build_history_text(d, d, "📊 Отчёт за сегодня"), back_kb())
+        selected_date = today_local()
+        await render(
+            update,
+            build_month_summary_text(selected_date),
+            month_result_kb(selected_date),
+        )
         return
 
     if data == "clockins":
@@ -752,12 +881,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             y = today - timedelta(days=1)
             await render(update, build_history_text(y, y, "📅 История · вчера"), back_kb("history"))
         elif kind == "7d":
-            await render(update, build_history_text(today - timedelta(days=6), today, "📅 История · последние 7 дней"), back_kb("history"))
+            await render(
+                update,
+                build_period_summary_text(
+                    today - timedelta(days=6),
+                    today,
+                    "📅 История · последние 7 дней",
+                ),
+                back_kb("history"),
+            )
         elif kind == "month":
-            first = today.replace(day=1)
-            await render(update, build_history_text(first, today, "📅 История · этот месяц"), back_kb("history"))
+            await render(
+                update,
+                build_month_summary_text(today),
+                month_result_kb(today),
+            )
+        elif kind == "all":
+            months = fetch_available_months()
+            await render(
+                update,
+                build_all_history_text(months),
+                history_months_kb(months),
+            )
         elif kind == "pick":
             await render(update, "📅 Выберите дату:", calendar_kb(today.year, today.month))
+        return
+
+    if data.startswith("histmonth:"):
+        _, year, month = data.split(":")
+        selected_date = datetime(int(year), int(month), 1).date()
+        await render(
+            update,
+            build_month_summary_text(selected_date),
+            month_result_kb(selected_date),
+        )
         return
 
     if data.startswith("cal:"):

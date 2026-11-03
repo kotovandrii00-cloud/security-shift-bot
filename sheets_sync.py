@@ -1531,3 +1531,42 @@ class GoogleSheetsSync:
             for title in selected_titles:
                 rows.extend(self._values_to_bot_rows(values_by_title.get(title, [])))
         return rows
+
+    def available_months_for_bot(self, through_date=None):
+        if not self.is_ready():
+            return []
+
+        drive, _ = self._services()
+        query = (
+            "mimeType = 'application/vnd.google-apps.spreadsheet' "
+            f"and '{self.folder_id}' in parents and trashed = false"
+        )
+        page_token = None
+        months = set()
+        through_month = through_date.replace(day=1) if through_date else None
+
+        while True:
+            request = drive.files().list(
+                q=query,
+                spaces="drive",
+                fields="nextPageToken, files(name)",
+                pageSize=1000,
+                pageToken=page_token,
+            )
+            result = self._execute(request, "List attendance spreadsheets")
+            for item in result.get("files", []):
+                name = str(item.get("name") or "").strip()
+                try:
+                    month_name, year_text = name.rsplit(" ", 1)
+                    month_number = RU_MONTHS.index(month_name) + 1
+                    month_date = datetime(int(year_text), month_number, 1).date()
+                except (ValueError, TypeError):
+                    continue
+                if through_month is None or month_date <= through_month:
+                    months.add(month_date)
+
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+
+        return sorted(months)
