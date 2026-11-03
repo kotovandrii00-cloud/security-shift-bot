@@ -422,6 +422,7 @@ def main_menu_kb():
                 InlineKeyboardButton("📅 История", callback_data="history"),
                 InlineKeyboardButton("📊 Отчёт", callback_data="report"),
             ],
+            [InlineKeyboardButton("🗂 Все месяцы", callback_data="hist:all")],
             [
                 InlineKeyboardButton("🟢 Приходы", callback_data="clockins"),
                 InlineKeyboardButton("🔴 Уходы", callback_data="clockouts"),
